@@ -12,8 +12,9 @@ exported copies of the state tree (SDE_states), the version list
 (SDE_versions) and each table's base, adds and deletes tables. Before the
 reconcile it names the owner's own edits across every state since the common
 ancestor with the parent, not only the head state, and warns when the parent
-reloaded rows the owner deleted. After the reconcile it compares a second,
-separate export with the saved snapshot.
+reloaded rows the owner edited or edited the same rows. After the reconcile it
+compares a second, separate export with the saved snapshot: the version must
+hold the parent's state, hold the owner's edits, and not have been posted.
 
     python reconverify.py --self-test
     python reconverify.py before/ --edit-version OWNER.SANDBOX
@@ -27,7 +28,8 @@ T.client.csv, which is the table as a client such as an arcpy layer read it.
 
 Exit codes: 0 nothing found, 1 at least one finding, 2 a file could not be
 read or written, 3 refused (the export is not a usable state tree, or the
-after export is the snapshot's own read), 64 usage error.
+after export is the snapshot's own read, or the snapshot is unusable), 64
+usage error.
 """
 
 from __future__ import print_function
@@ -43,6 +45,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -70,7 +73,14 @@ ROOT_STATE = 0
 
 # Written into every snapshot, and refused when absent, so a stray JSON file
 # is never read as a record of the version before its reconcile.
-FORMAT = "reconverify-1"
+FORMAT = "reconverify-2"
+
+# What a snapshot must hold, at the top and in each table. A hand-edited or
+# truncated file that still carries the format tag is refused, not crashed on.
+SNAP_KEYS = ("version", "parent", "version_state", "parent_state", "ancestor",
+             "oid_field", "key_field", "digests", "edited", "tables")
+SNAP_TABLE_KEYS = ("columns", "changed", "parent", "deleted", "deleted_keys",
+                   "changed_keys", "view")
 
 
 # ------------------------------------------------------------- decision core
@@ -78,11 +88,13 @@ FORMAT = "reconverify-1"
 def lineage(parents, state):
     """The states from `state` back to state 0, nearest first."""
     path = []
+    seen = set()
     while state != ROOT_STATE:
-        if state in path:
+        if state in seen:
             raise ValueError("the state tree loops at state %d" % state)
         if state not in parents:
             raise ValueError("state %d is not in states.csv" % state)
+        seen.add(state)
         path.append(state)
         state = parents[state]
     path.append(ROOT_STATE)
@@ -164,28 +176,58 @@ def ids(oids, sample):
 
 
 def reload_finding(name, deleted, parent_deleted, arrived, keys,
-                   deleted_keys, key_field, sample):
-    """A finding when rows the owner deleted come back under new ids.
+                   deleted_keys, changed_keys, key_field, sample):
+    """Findings when rows the owner edited come back under new object ids.
 
     With a key field the count is exact: an arriving row whose key belongs
-    to a row the owner deleted. Without one the signal is the parent deleting
-    the same rows the owner deleted while new rows arrive, which is what a
-    reload under new object ids looks like and what an ordinary edit can too.
+    to a row the owner deleted, or to a row the owner changed (the version
+    would then hold that key twice). A blank key is a hole in the data, not
+    a key, and matches nothing. Without a key field the signal is the parent
+    deleting the same rows the owner deleted while new rows arrive, which is
+    what a reload under new object ids looks like and what an ordinary edit
+    can too.
     """
     if key_field:
-        hits = sorted(o for o in arrived if keys[o] in deleted_keys)
+        out = []
+        hits = sorted(o for o in arrived
+                      if keys[o] and keys[o] in deleted_keys)
         if hits:
-            return ("%s: %d arriving row(s) carry the %s of a row the owner "
-                    "deleted%s. The owner's deletes do not hold them back"
-                    % (name, len(hits), key_field, ids(hits, sample)))
-        return None
+            out.append("%s: %d arriving row(s) carry the %s of a row the "
+                       "owner deleted%s. The owner's deletes do not hold "
+                       "them back" % (name, len(hits), key_field,
+                                      ids(hits, sample)))
+        dupes = sorted(o for o in arrived if o not in hits and keys[o]
+                       and keys[o] in changed_keys)
+        if dupes:
+            out.append("%s: %d arriving row(s) carry the %s of a row the "
+                       "owner changed%s. The version would hold each key "
+                       "twice" % (name, len(dupes), key_field,
+                                  ids(dupes, sample)))
+        return out
     absorbed = sorted(set(deleted) & set(parent_deleted))
     if absorbed and arrived:
-        return ("%s: the parent deleted %d of the rows the owner deleted%s, "
+        return ["%s: the parent deleted %d of the rows the owner deleted%s, "
                 "and %d new row(s) arrive. A reload under new object ids "
                 "looks like this. Rerun with --key-field to count it exactly"
-                % (name, len(absorbed), ids(absorbed, sample), len(arrived)))
-    return None
+                % (name, len(absorbed), ids(absorbed, sample), len(arrived))]
+    return []
+
+
+def conflict_finding(name, changed, deleted, p_changed, p_deleted, sample):
+    """A finding when both sides edited one row since the common ancestor.
+
+    Update against update, update against delete and delete against update
+    are the three conflict types Esri lists. A delete both sides made is not
+    one of them. Under row-level conflict detection every hit is a conflict.
+    """
+    hits = sorted((set(changed) & (set(p_changed) | set(p_deleted)))
+                  | (set(deleted) & set(p_changed)))
+    if not hits:
+        return None
+    return ("%s: %d row(s) were edited by the owner and also edited or "
+            "deleted in the parent since the ancestor%s. A row-level "
+            "reconcile reports each as a conflict, and the side it favours "
+            "overwrites the other" % (name, len(hits), ids(hits, sample)))
 
 
 def client_finding(name, table, version_view, sample):
@@ -221,7 +263,7 @@ def plan(export, version, oid_field, key_field, sample):
             "version_state": head, "parent_state": parent_head,
             "ancestor": ancestor, "oid_field": oid_field,
             "key_field": key_field, "digests": export["digests"],
-            "tables": {}}
+            "edited": bool(own), "tables": {}}
     for name in sorted(export["tables"]):
         table = export["tables"][name]
         a_view = view(name, table, a_lin)
@@ -243,11 +285,16 @@ def plan(export, version, oid_field, key_field, sample):
                      "deleted" % (len(p_inserted),
                                   len(p_changed) - len(p_inserted),
                                   len(p_deleted)))
-        deleted_keys = sorted(set(a_view[o][2] for o in deleted)) \
-            if key_field else []
+        deleted_keys = sorted(set(a_view[o][2] for o in deleted
+                                  if a_view[o][2])) if key_field else []
+        changed_keys = sorted(set(v_view[o][2] for o in changed
+                                  if v_view[o][2])) if key_field else []
         keys = dict((o, v[2]) for o, v in p_view.items())
-        found = reload_finding(name, deleted, p_deleted, p_inserted, keys,
-                               set(deleted_keys), key_field, sample)
+        findings.extend(reload_finding(
+            name, deleted, p_deleted, p_inserted, keys, set(deleted_keys),
+            set(changed_keys), key_field, sample))
+        found = conflict_finding(name, changed, deleted, p_changed,
+                                 p_deleted, sample)
         if found:
             findings.append(found)
         line, found = client_finding(name, table, v_view, sample)
@@ -261,6 +308,7 @@ def plan(export, version, oid_field, key_field, sample):
                            for o in changed),
             "deleted": deleted,
             "deleted_keys": deleted_keys,
+            "changed_keys": changed_keys,
             "view": sorted(v_view),
         }
     return lines, findings, snap
@@ -270,6 +318,17 @@ def check_snapshot(snap):
     """Refuse anything that is not a snapshot this tool wrote."""
     if not isinstance(snap, dict) or snap.get("format") != FORMAT:
         raise ValueError("the --before file is not a reconverify snapshot")
+    missing = [k for k in SNAP_KEYS if k not in snap]
+    if missing:
+        raise ValueError("the snapshot has no %s" % ", ".join(missing))
+    if not isinstance(snap["tables"], dict) or not snap["tables"]:
+        raise ValueError("the snapshot holds no table, so it verifies nothing")
+    for name, was in sorted(snap["tables"].items()):
+        gone = [k for k in SNAP_TABLE_KEYS
+                if not isinstance(was, dict) or k not in was]
+        if gone:
+            raise ValueError("the snapshot of table %s has no %s"
+                             % (name, ", ".join(gone)))
 
 
 def verify(snap, export, version, sample):
@@ -300,11 +359,24 @@ def verify(snap, export, version, sample):
                                     parent, snap["parent_state"],
                                     parent_head, old, ancestor)]
     findings = []
-    if head == snap["version_state"] and snap["parent_state"] != old:
-        findings.append("%s: the parent had moved past the common ancestor, "
-                        "yet the version still points at state %d. The "
+    # A reconcile leaves the parent's head in the version's own lineage. A
+    # version that never moved is checked against the parent as it is now. A
+    # version that moved is checked against the parent as the plan saw it.
+    if head == snap["version_state"]:
+        if parent_head not in v_lin:
+            findings.append("%s: the parent is at state %d, which the version "
+                            "does not hold, yet the version still points at "
+                            "state %d. The reconcile did not run, or did not "
+                            "finish" % (version, parent_head, head))
+    elif snap["parent_state"] not in v_lin:
+        findings.append("%s: the version moved to state %d but does not hold "
+                        "state %d, the parent's state at the plan. The "
                         "reconcile did not run, or did not finish"
-                        % (version, head))
+                        % (version, head, snap["parent_state"]))
+    # A post makes the parent hold the version's own head state. Rows alone
+    # cannot show it when the owner only deleted, so the state tree is read.
+    posted_state = snap["edited"] and head in p_lin
+    flagged = False
     key_field = snap["key_field"]
     for name in sorted(snap["tables"]):
         if name not in export["tables"]:
@@ -337,6 +409,8 @@ def verify(snap, export, version, sample):
         lines.append("  own rows identical    %d of %d"
                      % (len(changed) - len(lost), len(changed)))
         lines.append("  own rows in parent    %d" % len(posted))
+        gone = [o for o in was["deleted"]
+                if posted_state and o not in p_view]
         if back:
             findings.append("%s: %d row(s) the owner deleted are back%s"
                             % (name, len(back), ids(back, sample)))
@@ -347,15 +421,27 @@ def verify(snap, export, version, sample):
             findings.append("%s: %d row(s) the owner changed are now in the "
                             "parent %s%s. Something posted"
                             % (name, len(posted), parent, ids(posted, sample)))
+        elif gone:
+            findings.append("%s: %d row(s) the owner deleted are gone from "
+                            "the parent %s%s. Something posted"
+                            % (name, len(gone), parent, ids(gone, sample)))
+        flagged = flagged or bool(posted or gone)
         keys = dict((o, v[2]) for o, v in v_view.items())
-        found = reload_finding(name, was["deleted"], p_deleted, arrived, keys,
-                               set(was["deleted_keys"]), key_field, sample)
-        if found:
-            findings.append(found)
+        findings.extend(reload_finding(
+            name, was["deleted"], p_deleted, arrived, keys,
+            set(was["deleted_keys"]), set(was["changed_keys"]), key_field,
+            sample))
         line, found = client_finding(name, table, v_view, sample)
         lines.append(line)
         if found:
             findings.append(found)
+    for name in sorted(export["tables"]):
+        if name not in snap["tables"]:
+            lines.append("table %s is in the export but not in the snapshot, "
+                         "so it was not checked" % name)
+    if posted_state and not flagged:
+        findings.append("%s: the parent %s now holds the version's own state "
+                        "%d. Something posted" % (version, parent, head))
     return lines, findings
 
 
@@ -365,9 +451,13 @@ def read_csv(path):
     """Rows and header of a CSV, as dicts."""
     # utf-8-sig: SQL Server Management Studio and Excel can both write a BOM,
     # and read as plain UTF-8 the first header cell would not match its name.
-    with open(path, "r", newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        return list(reader), list(reader.fieldnames or [])
+    try:
+        with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            return list(reader), list(reader.fieldnames or [])
+    except UnicodeDecodeError as exc:
+        raise ValueError("%s is not UTF-8 text: %s"
+                         % (os.path.basename(path), exc))
 
 
 def need(header, names, path):
@@ -397,7 +487,8 @@ def load_table(folder, name, oid_field, key_field):
 
     def entry(row, state, where):
         return (to_int(row[oid_field], "%s %s" % (where, oid_field)), state,
-                row_hash(row, columns), row[key_field] if key_field else None)
+                row_hash(row, columns),
+                (row[key_field] or "").strip() if key_field else None)
 
     entries = [entry(r, ROOT_STATE, path) for r in rows]
     path = os.path.join(folder, name + ".adds.csv")
@@ -431,12 +522,18 @@ def load_export(folder, oid_field, key_field):
     need(header, ["state_id", "parent_state_id"], path)
     parents = dict((to_int(r["state_id"], path),
                     to_int(r["parent_state_id"], path)) for r in rows)
+    if len(parents) != len(rows):
+        raise ValueError("states.csv lists a state more than once")
     path = os.path.join(folder, "versions.csv")
     rows, header = read_csv(path)
     need(header, ["name", "state_id", "parent_name"], path)
     versions = dict((r["name"].strip(), (to_int(r["state_id"], path),
                                          (r["parent_name"] or "").strip()))
                     for r in rows)
+    if len(versions) != len(rows):
+        raise ValueError("versions.csv lists a version name more than once. "
+                         "Names are matched as written, so give each its "
+                         "OWNER.NAME")
     tables = dict((n[:-len(".base.csv")],
                    load_table(folder, n[:-len(".base.csv")], oid_field,
                               key_field))
@@ -462,11 +559,12 @@ def self_test():
             failed.append(label)
             print("FAIL  %s" % label)
 
-    def raises(fn, label):
+    def raises(fn, label, text=""):
         try:
             fn()
-        except ValueError:
-            check(True, label)
+        except ValueError as exc:
+            check(text in str(exc), label if text in str(exc) else
+                  "%s (wrong message %r)" % (label, str(exc)))
         except Exception as exc:
             check(False, "%s (wrong exception %r)" % (label, exc))
         else:
@@ -486,7 +584,8 @@ def self_test():
     # surface); an adds row puts its state second.
     base = [(i, "R-%02d" % i, "Road %d" % i, "DIRT") for i in range(1, 11)]
 
-    def export(label, states, versions, adds, deletes, client=None):
+    def export(label, states, versions, adds, deletes, client=None,
+               rows=None):
         folder = os.path.join(tmp, label)
         os.makedirs(folder)
         put(folder, "states.csv", "state_id,parent_state_id\n" + "".join(
@@ -494,7 +593,7 @@ def self_test():
         put(folder, "versions.csv", "name,state_id,parent_name\n" + "".join(
             "%s,%d,%s\n" % v for v in versions))
         put(folder, "ROADS.base.csv", "OBJECTID,ROAD_KEY,NAME,SURFACE\n" +
-            "".join("%d,%s,%s,%s\n" % r for r in base))
+            "".join("%d,%s,%s,%s\n" % r for r in (rows or base)))
         put(folder, "ROADS.adds.csv",
             "OBJECTID,SDE_STATE_ID,ROAD_KEY,NAME,SURFACE\n" + "".join(
                 "%d,%d,%s,%s,%s\n" % a for a in adds))
@@ -546,6 +645,12 @@ def self_test():
           "the common ancestor of the sandbox and its parent is state 1")
     check(common_ancestor(parents, 2, 2) == 2,
           "a state is its own common ancestor")
+    chain = dict((i, i - 1) for i in range(1, 30001))
+    started = time.time()
+    deep = lineage(chain, 30000)
+    check(len(deep) == 30001 and time.time() - started < 3,
+          "a 30000-state chain reads in well under 3 seconds, not the 9.5 "
+          "a list membership test took  <-- pinned defect")
     raises(lambda: lineage({5: 6, 6: 5}, 5),
            "a state tree that loops is refused, not walked forever")
     raises(lambda: lineage({5: 7}, 5),
@@ -707,17 +812,179 @@ def self_test():
         unmoved_dir, DEFAULT_OID_FIELD, None), "OWNER.SANDBOX", 10)
     check(any("still points at state 12" in f for f in findings),
           "a version that never moved, with a parent to pull, is a finding")
+    idle_dir = export("idle_after", tree, [
+        ("SDE.DEFAULT", 0, ""), ("OWNER.EDITS", 1, "SDE.DEFAULT"),
+        ("OWNER.SANDBOX", 12, "OWNER.EDITS")],
+        shared_adds + own_adds + quiet_adds,
+        shared_dels + own_dels + quiet_dels, before_view)
     in_sync = dict(snap_quiet, parent_state=1)
-    check(not any("still points" in f for f in verify(
-        in_sync, load_export(unmoved_dir, DEFAULT_OID_FIELD, None),
+    check(verify(in_sync, load_export(idle_dir, DEFAULT_OID_FIELD, None),
+                 "OWNER.SANDBOX", 10)[1] == [],
+          "but not when the parent is still at the common ancestor: nothing "
+          "to pull in")
+    early = dict(snap_quiet, parent_state=1)
+    check(any("still points at state 12" in f for f in verify(
+        early, load_export(unmoved_dir, DEFAULT_OID_FIELD, None),
         "OWNER.SANDBOX", 10)[1]),
-          "but not when the parent had nothing to pull in")
+          "a parent that moved after the plan, with the version unmoved, is "
+          "a finding  <-- pinned defect")
+
+    # ---- first review. A version that moved without a reconcile, a post
+    # of deletes only, a post no row shows, blank keys, an update reloaded
+    # under a new object id, and conflicts the plan can see.
+    more_tree = tree + [(13, 12), (20, 2)]
+
+    def reconciled(label, adds, dels, parent_at=2, rows=None, client=None):
+        """The sandbox at state 20, a child of state 2, after a reconcile."""
+        return export(label, more_tree, [
+            ("SDE.DEFAULT", 0, ""), ("OWNER.EDITS", parent_at, "SDE.DEFAULT"),
+            ("OWNER.SANDBOX", 20, "OWNER.EDITS")], adds, dels, client, rows)
+
+    def plan_of(folder, key=None):
+        return plan(load_export(folder, DEFAULT_OID_FIELD, key),
+                    "OWNER.SANDBOX", DEFAULT_OID_FIELD, key, 10)
+
+    def verify_of(snapshot, folder, key=None):
+        return verify(snapshot, load_export(folder, DEFAULT_OID_FIELD, key),
+                      "OWNER.SANDBOX", 10)
+
+    edit_dir = export("edit_after", more_tree, [
+        ("SDE.DEFAULT", 0, ""), ("OWNER.EDITS", 2, "SDE.DEFAULT"),
+        ("OWNER.SANDBOX", 13, "OWNER.EDITS")],
+        shared_adds + own_adds + quiet_adds + [(7, 13, "R-07", "Road 7",
+                                                "PAVED")],
+        shared_dels + own_dels + quiet_dels + [(7, 0, 13)], good_view)
+    check(any("does not hold state 2" in f
+              for f in verify_of(snap_quiet, edit_dir)[1]),
+          "a version that moved on one more edit, without the parent pulled "
+          "in, is a finding  <-- pinned defect")
+
+    del_dels = [(2, 0, 10), (3, 0, 12)]
+    del_snap = plan_of(export("del_before", tree, versions, shared_adds,
+                              shared_dels + del_dels))[2]
+    redo_del = [(2, 0, 20), (3, 0, 20)]
+    lines, findings = verify_of(del_snap, reconciled(
+        "del_posted", shared_adds, shared_dels + del_dels + redo_del, 20))
+    check(len(findings) == 1 and "2 row(s) the owner deleted are gone from "
+          "the parent OWNER.EDITS, e.g. 2, 3. Something posted" in findings[0],
+          "a post of delete-only edits is a finding  <-- pinned defect")
+    lines, findings = verify_of(del_snap, reconciled(
+        "del_good", shared_adds, shared_dels + del_dels + redo_del))
+    check(findings == [], "and the same deletes, reconciled but not posted, "
+          "are clean")
+    empty_snap = plan_of(export("empty_before", tree, versions, shared_adds,
+                                shared_dels))[2]
+    lines, findings = verify_of(empty_snap, reconciled(
+        "empty_posted", shared_adds, shared_dels, 20))
+    check(len(findings) == 1 and "now holds the version's own state 20. "
+          "Something posted" in findings[0],
+          "a post that no exported row shows is read from the state tree  "
+          "<-- pinned defect")
+    check(verify_of(empty_snap, reconciled(
+        "empty_good", shared_adds, shared_dels))[1] == [],
+          "and an edit-free version that was not posted is clean")
+    check(verify_of(dict(empty_snap, edited=False), reconciled(
+        "empty_noedit", shared_adds, shared_dels, 20))[1] == [],
+          "a version that never had an edit cannot have been posted")
+
+    blank_rows = [(2, " ", "Road 2", "DIRT") if r[0] == 2 else r for r in base]
+    lines, findings, blank_snap = plan_of(export(
+        "blank_before", tree, versions,
+        shared_adds + own_adds + [(300, 2, " ", "Road 300", "DIRT")],
+        shared_dels + own_dels, rows=blank_rows), "ROAD_KEY")
+    check(findings == [] and blank_snap["tables"]["ROADS"]["deleted_keys"]
+          == ["R-03"],
+          "a blank key is no key: a new road with a blank key does not "
+          "match a deleted road with a blank key  <-- pinned defect")
+    check(reload_finding("T", [], [], [5], {5: ""}, set([""]), set(), "K",
+                         10) == [],
+          "and a blank key in a hand-edited snapshot matches nothing")
+
+    upd_adds = [(4, 11, "R-04", "Road 4", "PAVED")]
+    upd_dels = [(4, 0, 11)]
+    twin = [(200, 2, "R-04", "Road 4", "DIRT")]
+    lines, findings, upd_snap = plan_of(export(
+        "upd_before", tree, versions, upd_adds + twin, upd_dels), "ROAD_KEY")
+    check(len(findings) == 1 and "1 arriving row(s) carry the ROAD_KEY of a "
+          "row the owner changed, e.g. 200" in findings[0],
+          "a parent row that repeats the key of an updated row is a finding  "
+          "<-- pinned defect")
+    lines, findings = verify_of(upd_snap, reconciled(
+        "upd_after", upd_adds + twin + [(4, 20, "R-04", "Road 4", "PAVED")],
+        upd_dels + [(4, 0, 20)]), "ROAD_KEY")
+    check(len(findings) == 1 and "1 arriving row(s) carry the ROAD_KEY of a "
+          "row the owner changed, e.g. 200. The version would hold each key "
+          "twice" in findings[0],
+          "and the version that holds the key twice fails verify  "
+          "<-- pinned defect")
+
+    lines, findings, conflict_snap = plan_of(export(
+        "conflict_before", tree, versions, upd_adds, upd_dels + [(4, 0, 2)]))
+    check(len(findings) == 1 and "1 row(s) were edited by the owner and also "
+          "edited or deleted in the parent since the ancestor, e.g. 4"
+          in findings[0],
+          "an owner update of a row the parent deleted is forecast at the "
+          "plan  <-- pinned defect")
+    findings = plan_of(export(
+        "conflict2_before", tree, versions,
+        [(5, 2, "R-05", "Road 5", "CHIPSEAL")],
+        [(5, 0, 2), (5, 0, 10)]))[1]
+    check(len(findings) == 1 and "e.g. 5" in findings[0],
+          "so is an owner delete of a row the parent updated")
+    check(conflict_finding("T", [], [5], [], [5], 10) is None,
+          "a delete both sides made is not a conflict")
+    lines, findings, same_snap = plan_of(export(
+        "same_before", tree, versions,
+        upd_adds + [(4, 2, "R-04", "Road 4", "PAVED")],
+        upd_dels + [(4, 0, 2)]))
+    table = same_snap["tables"]["ROADS"]
+    check(table["parent"]["4"] == table["changed"]["4"],
+          "the snapshot keeps the value the parent held for a changed row")
+    lines, findings = verify_of(same_snap, reconciled(
+        "same_after", upd_adds + [(4, 2, "R-04", "Road 4", "PAVED"),
+                                  (4, 20, "R-04", "Road 4", "PAVED")],
+        upd_dels + [(4, 0, 2), (4, 2, 20)]))
+    check(findings == [], "a parent that made the same edit as the owner is "
+          "not a post  <-- pinned defect")
+
+    lines, findings, mix_snap = plan_of(export(
+        "mix_before", tree, versions,
+        upd_adds + [(101, 12, "R-101", "Road 101", "PAVED"),
+                    (102, 12, "R-102", "Road 102", "PAVED")], upd_dels))
+    check("own edits             2 inserted, 1 updated, 0 deleted"
+          in "\n".join(lines),
+          "two inserts and one update are counted apart  <-- pinned defect")
+    raises(lambda: verify(snap_quiet, ex_good, "OWNER.EDITS", 10),
+           "a snapshot of another version is refused  <-- pinned defect",
+           "snapshot is of OWNER.SANDBOX, not OWNER.EDITS")
+    for key in SNAP_KEYS:
+        raises(lambda: check_snapshot(dict(
+            (k, v) for k, v in snap_quiet.items() if k != key)),
+            "a snapshot without %s is refused, not a KeyError  "
+            "<-- pinned defect" % key, "has no ")
+    raises(lambda: check_snapshot(dict(snap_quiet, tables={})),
+           "a snapshot with no table verifies nothing and is refused",
+           "holds no table")
+    raises(lambda: check_snapshot(dict(snap_quiet, tables={"ROADS": 5})),
+           "a snapshot table that is not an object is refused",
+           "table ROADS has no columns")
+    raises(lambda: check_snapshot(dict(snap_quiet, tables={"ROADS": {}})),
+           "a snapshot table without its keys is refused", "changed_keys")
+    side = os.path.join(tmp, "side_after")
+    shutil.copytree(good_dir, side)
+    put(side, "SIGNS.base.csv", "OBJECTID,NAME\n")
+    put(side, "SIGNS.adds.csv", "OBJECTID,SDE_STATE_ID,NAME\n")
+    put(side, "SIGNS.deletes.csv",
+        "SDE_DELETES_ROW_ID,SDE_STATE_ID,DELETED_AT\n")
+    lines, findings = verify_of(snap_quiet, side)
+    check(findings == [] and "table SIGNS is in the export but not in the "
+          "snapshot, so it was not checked" in lines,
+          "a table the snapshot never saw is named, not skipped in silence  "
+          "<-- pinned defect")
 
     raises(lambda: verify(snap_quiet, ex_quiet, "OWNER.SANDBOX", 10),
            "verifying against the snapshot's own export is refused  "
            "<-- pinned defect")
-    raises(lambda: verify(snap_quiet, ex_good, "OWNER.EDITS", 10),
-           "a snapshot of another version is refused")
     raises(lambda: verify({"format": "x"}, ex_good, "OWNER.SANDBOX", 10),
            "a JSON file without the snapshot format is refused")
     raises(lambda: check_snapshot([1, 2]),
@@ -725,9 +992,11 @@ def self_test():
     raises(lambda: verify(dict(snap_quiet, ancestor=12), ex_good,
                           "OWNER.SANDBOX", 10),
            "an old ancestor outside the new lineage is refused")
-    gone = dict(snap_quiet, tables=dict(snap_quiet["tables"], SIGNS={}))
+    gone = dict(snap_quiet, tables=dict(
+        snap_quiet["tables"], SIGNS=snap_quiet["tables"]["ROADS"]))
     raises(lambda: verify(gone, ex_good, "OWNER.SANDBOX", 10),
-           "a snapshot table missing from the export is refused")
+           "a snapshot table missing from the export is refused",
+           "table SIGNS is in the snapshot")
     widened = dict(snap_quiet, tables={"ROADS": dict(
         snap_quiet["tables"]["ROADS"], columns=["NAME"])})
     raises(lambda: verify(widened, ex_good, "OWNER.SANDBOX", 10),
@@ -764,6 +1033,21 @@ def self_test():
     put(empty, "versions.csv", "name,state_id,parent_name\n")
     raises(lambda: load_export(empty, "OBJECTID", None),
            "an export with no table is refused")
+    raises(lambda: load_export(bad_export(
+        "dupe_version", versions_csv="name,state_id,parent_name\n"
+        "OWNER.A,1,SDE.DEFAULT\nOWNER.A,2,SDE.DEFAULT\n"), "OBJECTID", None),
+        "a version name listed twice is refused, not collapsed  "
+        "<-- pinned defect", "more than once")
+    raises(lambda: load_export(bad_export(
+        "dupe_state", states_csv="state_id,parent_state_id\n1,0\n1,0\n"),
+        "OBJECTID", None), "a state listed twice is refused, not collapsed  "
+        "<-- pinned defect", "more than once")
+    wide = bad_export("wide_text")
+    with open(os.path.join(wide, "states.csv"), "wb") as handle:
+        handle.write(b"state_id,parent_state_id\n1,0\n# caf\xe9\n")
+    raises(lambda: load_export(wide, "OBJECTID", None),
+           "a file that is not UTF-8 is refused and named  "
+           "<-- pinned defect", "states.csv is not UTF-8")
     bom = bad_export("bom", states_csv="\ufeffstate_id,parent_state_id\n" +
                      "".join("%d,%d\n" % s for s in tree))
     check(load_export(bom, "OBJECTID", None)["parents"] == parents,
@@ -819,6 +1103,12 @@ def self_test():
     code, out, err = run_cli([good_dir] + sv + ["--before", os.path.join(
         tmp, "junk.json")])
     check(code == 3, "a --before file that is not JSON exits 3")
+    put(tmp, "thin.json", json.dumps({"format": FORMAT, "version": "X"}))
+    code, out, err = run_cli([good_dir] + sv + ["--before", os.path.join(
+        tmp, "thin.json")])
+    check(code == 3 and "the snapshot has no " in err,
+          "a snapshot that lost keys exits 3, not the 1 of a finding  "
+          "<-- pinned defect")
     code, out, err = run_cli([good_dir] + sv + ["--before", os.path.join(
         tmp, "nowhere.json")])
     check(code == 2, "a --before file that does not exist exits 2")
@@ -878,11 +1168,13 @@ def self_test():
         check(False, "probe: a false condition must be recorded")
         raises(lambda: None, "probe: a call that raises nothing must fail")
         raises(lambda: [][0], "probe: the wrong exception must fail")
+        raises(lambda: lineage({5: 7}, 5), "probe: the wrong message must "
+               "fail", "no such text")
     finally:
         sys.stdout = quiet
     probe = failed[mark:]
     del failed[mark:]
-    check(len(probe) == 3,
+    check(len(probe) == 4,
           "check() and raises() really do record a failure  <-- pinned defect")
 
     def summary(passed_count, failures):
@@ -1028,10 +1320,12 @@ def main(argv=None):
                   % args.snapshot)
         else:
             try:
+                # Serialised first, so a failure cannot leave half a file.
                 # "x" refuses an existing file: an old snapshot is the only
                 # record of the version before its reconcile.
+                text = json.dumps(snap, sort_keys=True)
                 with open(args.snapshot, "x", encoding="utf-8") as handle:
-                    json.dump(snap, handle, sort_keys=True)
+                    handle.write(text)
             except (IOError, OSError) as exc:
                 print("error: could not write %s: %s" % (args.snapshot, exc),
                       file=sys.stderr)
