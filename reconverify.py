@@ -81,6 +81,9 @@ STATE_FIELD = "SDE_STATE_ID"
 ROW_ID_FIELD = "SDE_DELETES_ROW_ID"
 DELETED_AT_FIELD = "DELETED_AT"
 
+# The per-table files that travel with a <T>.base.csv.
+DELTA_SUFFIXES = (".adds.csv", ".deletes.csv", ".client.csv")
+
 # The base table is state 0, and every lineage ends there.
 ROOT_STATE = 0
 
@@ -593,7 +596,11 @@ def verify(snap, export, version, sample):
                         % (version, head, snap["parent_state"], parent_head))
     # A post makes the parent hold the version's own head state. Rows alone
     # cannot show it when the owner only deleted, so the state tree is read.
-    posted_state = snap["edited"] and head in p_lin
+    # The plan's parent lineage always held the version's head when the
+    # version had no edit, so a head that is new to the parent's lineage is a
+    # post whether or not the owner edited.
+    posted_state = head in p_lin and head not in lineage(
+        parents, snap["parent_state"])
     flagged = False
     key_field = snap["key_field"]
     for name in sorted(snap["tables"]):
@@ -795,6 +802,17 @@ def load_export(folder, oid_field, key_field):
         raise ValueError("versions.csv names a parent that is not a version "
                          "name, for %s. Names are matched as written, so fix "
                          "the parent_name column" % ", ".join(orphans))
+    # A delta file without its base would drop that table, and any edit the
+    # owner made in it, out of every check unflagged.
+    based = set(n[:-len(".base.csv")] for n in names if n.endswith(".base.csv"))
+    stray = sorted((n[:-len(suffix)], n) for n in names
+                   for suffix in DELTA_SUFFIXES
+                   if n.endswith(suffix) and n[:-len(suffix)] not in based)
+    if stray:
+        raise ValueError("%s has no %s.base.csv, so the table would go "
+                         "unchecked. Export the base table too, or remove "
+                         "the delta files" % (", ".join(n for _, n in stray),
+                                              stray[0][0]))
     tables = dict((n[:-len(".base.csv")],
                    load_table(folder, n[:-len(".base.csv")], oid_field,
                               key_field))
@@ -1164,9 +1182,10 @@ def self_test():
     check(verify_of(empty_snap, reconciled(
         "empty_good", shared_adds, shared_dels))[1] == [],
           "and an edit-free version that was not posted is clean")
-    check(verify_of(dict(empty_snap, edited=False), reconciled(
-        "empty_noedit", shared_adds, shared_dels, 20))[1] == [],
-          "a version that never had an edit cannot have been posted")
+    check(len(verify_of(dict(empty_snap, edited=False), reconciled(
+        "empty_noedit", shared_adds, shared_dels, 20))[1]) == 1,
+          "a post is read from the state tree whatever the snapshot says "
+          "about edits  <-- pinned defect")
 
     blank_rows = [(2, " ", "Road 2", "DIRT") if r[0] == 2 else r for r in base]
     lines, findings, blank_snap = plan_of(export(
@@ -1806,6 +1825,41 @@ def self_test():
     check(run_cli([quiet_dir] + sv + ["--unp"])[0] == 64,
           "a unique prefix --unp is refused too  <-- pinned defect")
 
+    # ---- fourth review. A post with no owner edit, delta files without a
+    # base table, and an empty flag value.
+    idle_tree = [(0, 0), (1, 0), (2, 1), (4, 2), (5, 2)]
+
+    def idle_pair(label, version_at, parent_at):
+        return export(label, idle_tree, [
+            ("SDE.DEFAULT", 0, ""), ("OWNER.EDITS", parent_at, "SDE.DEFAULT"),
+            ("OWNER.SANDBOX", version_at, "OWNER.EDITS")], [], [])
+
+    idle_before = idle_pair("idle_before", 1, 2)
+    snap_idle = plan_of(idle_before)[2]
+    check(snap_idle["edited"] is False and plan_of(idle_before)[1] == [],
+          "a sandbox with no owner edit plans clean")
+    lines, findings = verify_of(snap_idle, idle_pair("idle_posted", 4, 4))
+    check(len(findings) == 1 and "now holds the version's own state 4. "
+          "Something posted" in findings[0],
+          "a post with no owner edit is a finding, not a clean exit 0  "
+          "<-- pinned defect")
+    check(verify_of(snap_idle, idle_pair("idle_quiet", 5, 2))[1] == [],
+          "a no-post reconcile of a sandbox with no edit stays clean")
+
+    for orphan, label in (
+            ("PARCELS_adds_csv", "adds"), ("PARCELS_deletes_csv", "deletes"),
+            ("PARCELS_client_csv", "client")):
+        raises(lambda: load_export(bad_export(
+            "orphan_" + label, **{orphan: "OBJECTID\n"}), "OBJECTID", None),
+            "a %s delta file with no PARCELS.base.csv is refused, not dropped  "
+            "<-- pinned defect" % label, "no PARCELS.base.csv")
+
+    for flag in ("--before", "--snapshot", "--key-field", "--oid-field"):
+        code, out, err = run_cli([quiet_dir] + sv + [flag, ""])
+        check(code == 64 and "%s needs a value" % flag in err and not out,
+              "an empty %s is a usage error, not a silent plan  "
+              "<-- pinned defect" % flag)
+
     # ---- the harness itself
     quiet = sys.stdout
     sys.stdout = io.StringIO()
@@ -1933,6 +1987,12 @@ def main(argv=None):
 
     if args.self_test:
         return self_test()
+    for flag in ("before", "snapshot", "key_field", "oid_field"):
+        if getattr(args, flag) == "":
+            # An empty value is falsy, so a job that passes an unset
+            # variable would silently run another mode.
+            return usage("--%s needs a value. An empty one is refused, not "
+                         "ignored." % flag.replace("_", "-"))
     if not args.export or not args.edit_version:
         return usage("an export directory and --edit-version are required. "
                      "Use --self-test to check the tool without them.")

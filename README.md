@@ -49,6 +49,8 @@ PASS  a post of delete-only edits is a finding  <-- pinned defect
 ...
 PASS  a post that no exported row shows is read from the state tree  <-- pinned defect
 ...
+PASS  a post with no owner edit is a finding, not a clean exit 0  <-- pinned defect
+...
 PASS  a blank key is no key: a new road with a blank key does not match a deleted road with a blank key  <-- pinned defect
 ...
 PASS  a parent row that repeats the key of an updated row is a finding  <-- pinned defect
@@ -78,13 +80,15 @@ PASS  verify exits 1 for a nested version the reconcile skipped, without any fla
 ...
 PASS  a unique prefix --unp is refused too  <-- pinned defect
 ...
+PASS  an empty --before is a usage error, not a silent plan  <-- pinned defect
+...
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-186 assertions, 0 failed
+196 assertions, 0 failed
 ```
 
-The full run prints all 186 assertions. Each `...` line above is where this block is cut.
+The full run prints all 196 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -117,11 +121,11 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 186 assertions, line for line, on Windows (Python 3.13.2), on
+The self-test prints the same 196 assertions, line for line, on Windows (Python 3.13.2), on
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (979 statements, 214 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (1001 statements, 224 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -140,6 +144,9 @@ You make the exports. The tool reads one directory of CSV files, as UTF-8 text w
 | `T.adds.csv` | the object id column, `SDE_STATE_ID`, and the same other columns | the adds table |
 | `T.deletes.csv` | `SDE_DELETES_ROW_ID`, `SDE_STATE_ID`, `DELETED_AT` | the deletes table |
 | `T.client.csv` | the object id column and the same other columns, optional | the table as a client read it |
+
+A `T.adds.csv`, `T.deletes.csv` or `T.client.csv` with no `T.base.csv` beside it is refused with
+exit 3. Dropping that table would leave its edits unchecked, and the tool would still exit 0.
 
 The delta tables are documented by Esri. The adds table holds "the state to which the feature
 belongs". In the deletes table, `SDE_state_ID` is "the state from which the row is being
@@ -219,7 +226,7 @@ with exit 64 instead of being read as `--apply`, and `--snap` and `--bef` are re
 way. A snapshot is never overwritten. Delete or move the old file first.
 
 `--unposted` takes no `--before`, `--snapshot` or `--apply`. `--rows`, `--sample` and
-`--tree` need the mode that uses them: `--rows` and `--tree` need `--unposted`, and `--sample` is refused with it. A flag that would do nothing is a usage error, exit 64.
+`--tree` need the mode that uses them: `--rows` and `--tree` need `--unposted`, and `--sample` is refused with it. A flag that would do nothing is a usage error, exit 64. So is an empty value for `--before`, `--snapshot`, `--key-field` or `--oid-field`: a job that passes an unset variable would otherwise run a plan, which exits 0, in place of the verify.
 
 `--before` takes no `--snapshot`, `--oid-field` or `--key-field`. The snapshot carries the fields
 it was taken with, and a different key would compare two reads that were never comparable.
@@ -486,8 +493,8 @@ treat the snapshot as sensitive as that column.
 | 0 | Nothing found. |
 | 1 | At least one finding. A nested version that is behind is one in a verify run and under `--unposted`. So is a version that moved but lacks the parent's new head. A plan names nested versions and does not judge them. With `--unposted`, so is an unposted edit in the named version or in a nested one, a row that matches its ancestor, or an export the tool could not read an edit from, including one where the only visible edits are ones the parent already holds. |
 | 2 | A file could not be read or written, including a snapshot that already exists. |
-| 3 | Refused. The export is not a usable state tree, a `parent_name` matches no version, more than one version has no `parent_name`, a CSV row has more or fewer cells than its header, the after export is the snapshot's own read, a file is not UTF-8, or the snapshot is unusable. |
-| 64 | Usage error, including an unknown or abbreviated flag. |
+| 3 | Refused. The export is not a usable state tree, a `parent_name` matches no version, a delta file has no base table, more than one version has no `parent_name`, a CSV row has more or fewer cells than its header, the after export is the snapshot's own read, a file is not UTF-8, or the snapshot is unusable. |
+| 64 | Usage error, including an unknown or abbreviated flag and an empty flag value. |
 
 Exit 3 is deliberately not exit 1. A job that files a finding on exit 1 must not file one when
 the tool could not make sense of its input.
@@ -497,8 +504,9 @@ the tool could not make sense of its input.
 - The export contract is hand-built. No SQL in this repository has run against a live server. The
   parent column of the versions table is not named on any Esri page I could read, so you build
   `parent_name` from your own release. The delta table column names come from Esri's 10.0 pages.
-- A post is read from the state tree when the plan saw an edit. A version with no edits at the
-  plan cannot be shown to have posted, and a sandbox with no edits verifies as `0 of 0`, exit 0.
+- A post is read from the state tree, with or without owner edits: a head state that the parent's
+  lineage did not hold at the plan and holds now is a finding. A sandbox with no edits at the plan
+  verifies as `0 of 0` rows when nothing posted, so exit 0 there rests on the state tree alone.
 - The post test assumes a post leaves the parent holding the version's head state. Esri says only
   that "the post process pushes changes from an edit version to the target version"
   ([Versioning vocabulary](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/versioning-vocabulary.html)),
@@ -506,8 +514,8 @@ the tool could not make sense of its input.
   The row comparison still catches a posted change or delete that is visible in the rows.
 - Edits made after the plan are not in the snapshot, so `own edits intact` covers only the edits
   the plan named.
-- Only tables that have a `T.base.csv` are checked. An edit in a table that was not exported is
-  invisible, apart from the post test above. A table that is in the second export and not in the
+- Only tables that have a `T.base.csv` are checked. A table with delta files and no base is
+  refused, but an edit in a table that was not exported at all is invisible, apart from the post test above. A table that is in the second export and not in the
   snapshot is named in the output, is not checked, and is a finding, so the run exits 1.
 - The row comparison is by text. The client read and the delta tables must come from one
   formatter. A client file that writes NULL as `None` where the delta export writes an empty
@@ -518,8 +526,7 @@ the tool could not make sense of its input.
 - The freshness test compares file bytes. An export that differs by one byte from the snapshot's
   export passes it. A byte-different re-export of an unchanged state counts as fresh. The tool
   cannot prove that the second export came from a different process.
-- A reconcile script can also raise a problem when a table's row count jumps by more
-  than 10 percent. This tool prints `N -> M rows, K arrived` and flags growth only when it
+- This tool prints `N -> M rows, K arrived` and flags growth only when it
   matches a key or an owner delete. A parent reload that overlaps none of the owner's rows grows
   the version with no finding.
 - After a compress, the states the snapshot names may be gone. A snapshot whose old common
@@ -528,8 +535,8 @@ the tool could not make sense of its input.
   headers, is refused with exit 3 and `has no column`. Write the header even for an empty table.
 - A CSV cell larger than 128 KB, such as long geometry text, raises `csv.Error` and the run exits
   2.
-- Every export file is read whole into memory. Walking the lineage of a 30,000-state chain takes
-  about 0.01 seconds. That is not a timing of the whole export load, and a very large adds table
+- Every export file is read whole into memory. Walking the lineage of a 30,000-state chain took
+  about 0.005 seconds on the Windows workstation. That is not a timing of the whole export load, and a very large adds table
   is not what this is for.
 - The self-test writes synthetic exports to a temporary directory and removes it at the end. That
   is not gated by `--apply`, because it never touches a geodatabase or any file you named. A
@@ -575,9 +582,7 @@ the tool could not make sense of its input.
 - Output is printed with the console's encoding. A key, version or table name that the encoding
   cannot print is written as a backslash escape, such as `\u2192`, so the run finishes with its
   real exit code. Set `PYTHONUTF8=1` to print the characters themselves.
-- Any uncaught exception exits 1, the same code as a finding. A snapshot edited by hand into the
-  wrong value types, with its keys and format tag intact, can crash the run that way instead of
-  exit 3.
+- Any uncaught exception exits 1, the same code as a finding.
 - Values from the export are printed as they are, so a control or escape character in a key or
   name reaches the terminal.
 - The snapshot check tests keys, not value types. A snapshot edited by hand to hold the wrong type
@@ -588,10 +593,19 @@ the tool could not make sense of its input.
   export file in the freshness test. A `.json` snapshot there does not. The tool does not
   restrict the snapshot's file permissions.
 
-- The README demo outputs come from the same synthetic exports that the self-test builds, but the
-  self-test prints no plan or verify text and the demo names (`before_conflict`, `after_idle` and
-  the like) are not the self-test's labels. The exports are not shipped, so a reader cannot rerun
-  the demos from the repository alone.
+- The demo outputs are trimmed from runs on synthetic exports that are not shipped, and one line
+  (the client read) was removed from the `after_clean` demo. Only the reload demo matches a
+  self-test fixture, so a reader cannot rerun the demos from the repository alone.
+- A freshly created, unedited version may exit 1 under `--unposted` if the server gives it a
+  state of its own. How a live server numbers a new version's state was not checked.
+- A key or name is printed as written. The tool writes no CSV, so it has no formula guard: a key
+  such as `=HYPERLINK(...)` is stored as plain text in the snapshot, and you must guard cells
+  that begin with `=`, `+`, `-`, `@`, a tab or a carriage return before you paste a report or
+  snapshot key into a spreadsheet.
+- A CSV that repeats a column name keeps only the last cell for that name, so an edit confined to
+  an earlier duplicate is invisible to the row comparison. Export each column once.
+- Whole-number cells are read with Python `int()`, which also accepts `+5`, ` 5 `, `5_0` and
+  non-ASCII digits. A malformed id of that kind is read as a number and not refused.
 - The post-reconcile state-tree shape (a new state whose parent is the target's head) is this
   tool's model, matched to no Esri page, and was never checked against a live geodatabase.
 - The stale-layer cause in the opening story is the author's reading of the incident and was not
