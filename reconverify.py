@@ -21,6 +21,16 @@ hold the parent's state, hold the owner's edits, and not have been posted.
     python reconverify.py before/ --edit-version OWNER.SANDBOX --key-field ROAD_KEY
     python reconverify.py before/ --edit-version OWNER.SANDBOX --snapshot s.json --apply
     python reconverify.py after/ --edit-version OWNER.SANDBOX --before s.json
+    python reconverify.py after/ --edit-version OWNER.SANDBOX --before s.json --tree
+    python reconverify.py now/ --edit-version OWNER.SANDBOX --unposted [--tree]
+
+--unposted lists the edits a version saved that its parent does not hold, row
+by row, from one fresh export. A version whose states hold no edit that an
+exported table shows is a finding, because the tool cannot tell an empty state
+from an edit in a table it was not given. --tree adds every version nested
+under the one named: the same list for each, and a finding for each one that no
+reconcile has reached since its parent moved, whatever exit code the run that
+skipped it gave.
 
 The export is a directory of CSV files: states.csv, versions.csv, and for
 each table T the files T.base.csv, T.adds.csv, T.deletes.csv and, optionally,
@@ -56,6 +66,10 @@ DEFAULT_OID_FIELD = "OBJECTID"
 
 # How many object ids are listed after a finding. The count is the finding.
 DEFAULT_SAMPLE = 10
+
+# How many unposted rows --unposted lists per table before it says how many
+# more there are. --rows 0 lists every row.
+DEFAULT_ROWS = 100
 
 # =============================================================================
 # End of CONFIGURATION.
@@ -247,6 +261,178 @@ def client_finding(name, table, version_view, sample):
                   % (name, len(bad), ids(bad, sample)))
 
 
+def subtree(versions, name):
+    """(child, parent) of every version nested under `name`, nearest first.
+
+    The tree is read from the parent names in versions.csv. A loop in it is
+    refused, so a bad export cannot send the walk round forever.
+    """
+    kids = {}
+    for child, (_, parent) in versions.items():
+        kids.setdefault(parent, []).append(child)
+    out = []
+    seen = set([name])
+    queue = [name]
+    while queue:
+        parent = queue.pop(0)
+        for child in sorted(kids.get(parent, [])):
+            if child in seen:
+                raise ValueError("the version tree loops at %s" % child)
+            seen.add(child)
+            out.append((child, parent))
+            queue.append(child)
+    return out
+
+
+def behind(export, pairs):
+    """The (child, parent, child head, parent head) whose lineage lacks the
+    parent's head state: no reconcile of the child has run since the parent
+    last moved.
+    """
+    out = []
+    for child, parent in pairs:
+        head = export["versions"][child][0]
+        parent_head = export["versions"][parent][0]
+        if parent_head not in lineage(export["parents"], head):
+            out.append((child, parent, head, parent_head))
+    return out
+
+
+def nested_finding(child, parent, head, parent_head):
+    return ("%s: behind its parent %s. Its state %d does not hold state %d, "
+            "where the parent now points. A reconcile run did not reach it, "
+            "or ran before the parent moved" % (child, parent, head,
+                                                parent_head))
+
+
+def unchecked_note(export, version, tree):
+    """A sentence for the verdict when nested versions were not looked at."""
+    if tree:
+        return ""
+    pairs = subtree(export["versions"], version)
+    if not pairs:
+        return ""
+    return (" %d nested version(s) under %s, %d behind their parent, are not "
+            "part of this verdict. Add --tree."
+            % (len(pairs), version, len(behind(export, pairs))))
+
+
+ROW_ORDER = {"inserted": 0, "updated": 1, "deleted": 2}
+
+
+def unposted_rows(a_view, v_view, p_view, own, theirs):
+    """(rows, held, reverted): the own edits the parent does not hold.
+
+    A row is (object id, kind, key, state, parent_edited). An own edit is not
+    unposted when the parent already holds the same row (or no longer holds
+    the deleted one), or when the row was edited and put back to its content
+    at the ancestor. Those are counted, not listed.
+    """
+    changed, deleted = edits(a_view, v_view, own)
+    p_changed, p_deleted = edits(a_view, p_view, theirs)
+    touched = set(p_changed) | set(p_deleted)
+    rows = []
+    held = 0
+    reverted = 0
+    for o in changed:
+        state, digest, key = v_view[o]
+        if o in a_view and a_view[o][1] == digest:
+            reverted += 1
+        elif o in p_view and p_view[o][1] == digest:
+            held += 1
+        else:
+            rows.append((o, "updated" if o in a_view else "inserted", key,
+                         state, o in touched))
+    for o in deleted:
+        if o in p_view:
+            rows.append((o, "deleted", a_view[o][2], None, o in touched))
+        else:
+            held += 1
+    rows.sort(key=lambda r: (ROW_ORDER[r[1]], r[0]))
+    return rows, held, reverted
+
+
+def row_line(row, key_field):
+    oid, kind, key, state, touched = row
+    text = "    %-8s %d" % (kind, oid)
+    if key_field:
+        text += "  %s %s" % (key_field, key or "(blank)")
+    if state is not None:
+        text += "  written at state %d" % state
+    if touched:
+        text += "  (the parent also edited it since the ancestor)"
+    return text
+
+
+def unposted_report(export, version, key_field, cap):
+    """(lines, findings): edits a version saved that its parent does not hold.
+
+    The state tree gives the headline. Rows give the list. A version whose
+    states hold no edit that any exported table shows cannot be told from one
+    whose edits sit in a table that was not exported, so that is a finding.
+    """
+    parents = export["parents"]
+    head, parent, parent_head, ancestor = resolve(export, version)
+    v_lin = lineage(parents, head)
+    p_lin = lineage(parents, parent_head)
+    a_lin = lineage(parents, ancestor)
+    own = set(v_lin) - set(a_lin)
+    theirs = set(p_lin) - set(a_lin)
+    lines = ["version %s at state %d, parent %s at state %d, common ancestor "
+             "%d" % (version, head, parent, parent_head, ancestor)]
+    if not own:
+        lines.append("  nothing to post: the parent holds every state of the "
+                     "version")
+        return lines, []
+    lines.append("  states the parent does not hold  %d" % len(own))
+    findings = []
+    seen = 0
+    for name in sorted(export["tables"]):
+        table = export["tables"][name]
+        rows, held, reverted = unposted_rows(
+            view(name, table, a_lin), view(name, table, v_lin),
+            view(name, table, p_lin), own, theirs)
+        seen += len(rows) + held + reverted
+        kinds = [sum(1 for r in rows if r[1] == k) for k in
+                 ("inserted", "updated", "deleted")]
+        lines.append("table %s" % name)
+        lines.append("  unposted              %d row(s): %d inserted, %d "
+                     "updated, %d deleted" % ((len(rows),) + tuple(kinds)))
+        lines.append("  already in the parent %d, edited and put back %d"
+                     % (held, reverted))
+        shown = rows[:cap] if cap else rows
+        lines.extend(row_line(r, key_field) for r in shown)
+        if len(shown) < len(rows):
+            lines.append("    ... and %d more. --rows 0 lists every row"
+                         % (len(rows) - len(shown)))
+        if rows:
+            findings.append("%s: %d edit(s) saved in %s were never posted to "
+                            "%s. The rows are listed above"
+                            % (name, len(rows), version, parent))
+    if not seen:
+        findings.append("%s: holds %d state(s) the parent does not, and no "
+                        "exported table shows an edit in them. The edits sit "
+                        "in a table that was not exported, or the states hold "
+                        "none. The tool cannot tell which"
+                        % (version, len(own)))
+    return lines, findings
+
+
+def unposted_tree(export, version, key_field, cap, tree):
+    """(lines, findings) for a version, and with `tree` every nested one."""
+    lines, findings = unposted_report(export, version, key_field, cap)
+    if not tree:
+        return lines, findings
+    pairs = subtree(export["versions"], version)
+    for child, parent in pairs:
+        more, found = unposted_report(export, child, key_field, cap)
+        lines.append("nested version %s" % child)
+        lines.extend(more)
+        findings.extend(found)
+    findings.extend(nested_finding(*b) for b in behind(export, pairs))
+    return lines, findings
+
+
 def plan(export, version, oid_field, key_field, sample):
     """(lines, findings, snapshot) for a version before its reconcile."""
     parents = export["parents"]
@@ -258,6 +444,11 @@ def plan(export, version, oid_field, key_field, sample):
     theirs = set(p_lin) - set(a_lin)
     lines = ["version %s at state %d, parent %s at state %d, common ancestor "
              "%d" % (version, head, parent, parent_head, ancestor)]
+    nested = subtree(export["versions"], version)
+    if nested:
+        lines.append("nested versions        %d: %s. Check them after the "
+                     "reconcile with --tree" % (len(nested), ", ".join(
+                         c for c, _ in nested)))
     findings = []
     snap = {"format": FORMAT, "version": version, "parent": parent,
             "version_state": head, "parent_state": parent_head,
@@ -331,7 +522,7 @@ def check_snapshot(snap):
                              % (name, ", ".join(gone)))
 
 
-def verify(snap, export, version, sample):
+def verify(snap, export, version, sample, tree=False):
     """(lines, findings) for a version after its reconcile, from a new read."""
     check_snapshot(snap)
     if snap["version"] != version:
@@ -442,6 +633,13 @@ def verify(snap, export, version, sample):
     if posted_state and not flagged:
         findings.append("%s: the parent %s now holds the version's own state "
                         "%d. Something posted" % (version, parent, head))
+    pairs = subtree(export["versions"], version)
+    if pairs:
+        late = behind(export, pairs)
+        lines.append("nested versions        %d, %d behind their parent"
+                     % (len(pairs), len(late)))
+        if tree:
+            findings.extend(nested_finding(*b) for b in late)
     return lines, findings
 
 
@@ -1056,6 +1254,195 @@ def self_test():
           == row_hash({"A": "1"}, ["A", "B"]),
           "an empty cell and a missing cell hash the same")
 
+    # ---- unposted rows and nested versions. OWNER.CHILD hangs off the
+    # sandbox at state 13 and inserts road 102. OWNER.GRAND hangs off the
+    # child at state 14 and deletes road 5.
+    nv_tree = tree + [(13, 12), (14, 13)]
+    nv_versions = versions + [("OWNER.CHILD", 13, "OWNER.SANDBOX"),
+                              ("OWNER.GRAND", 14, "OWNER.CHILD")]
+    child_adds = [(102, 13, "R-102", "Road 102", "PAVED")]
+    grand_dels = [(5, 0, 14)]
+    nv_dir = export("nested_before", nv_tree, nv_versions,
+                    shared_adds + own_adds + quiet_adds + child_adds,
+                    shared_dels + own_dels + quiet_dels + grand_dels)
+    ex_nv = load_export(nv_dir, DEFAULT_OID_FIELD, "ROAD_KEY")
+    sandbox_kids = [("OWNER.CHILD", "OWNER.SANDBOX"),
+                    ("OWNER.GRAND", "OWNER.CHILD")]
+    check(subtree(ex_nv["versions"], "OWNER.SANDBOX") == sandbox_kids,
+          "the versions nested under the sandbox are its child and grandchild")
+    check(subtree(ex_nv["versions"], "OWNER.EDITS") ==
+          [("OWNER.SANDBOX", "OWNER.EDITS")] + sandbox_kids,
+          "and the parent's tree runs through the sandbox to both")
+    check(subtree(ex_nv["versions"], "OWNER.GRAND") == [],
+          "a version with no child has an empty tree")
+    raises(lambda: subtree({"A": (1, "B"), "B": (2, "A")}, "A"),
+           "a version tree that loops is refused, not walked forever",
+           "loops at")
+    raises(lambda: subtree({"X": (1, "X")}, "X"),
+           "a version that is its own parent is refused", "loops at")
+    check(behind(ex_nv, sandbox_kids) == [],
+          "before the reconcile no nested version is behind its parent")
+
+    lines, findings, _ = plan(ex_nv, "OWNER.SANDBOX", "OBJECTID", None, 10)
+    check("nested versions        2: OWNER.CHILD, OWNER.GRAND. Check them "
+          "after the reconcile with --tree" in "\n".join(lines),
+          "the plan names the nested versions it cannot reconcile for you")
+
+    lines, findings = unposted_report(ex_nv, "OWNER.SANDBOX", "ROAD_KEY", 100)
+    text = "\n".join(lines)
+    check("states the parent does not hold  3" in text,
+          "the unposted list opens with the states the parent lacks, read "
+          "from the state tree")
+    check("unposted              4 row(s): 1 inserted, 1 updated, 2 deleted"
+          in text and "already in the parent 0, edited and put back 0"
+          in text, "and counts the unposted rows by kind")
+    check("    inserted 101  ROAD_KEY R-101  written at state 12" in text
+          and "    updated  4  ROAD_KEY R-04  written at state 11" in text
+          and "    deleted  2  ROAD_KEY R-02" in text
+          and "    deleted  3  ROAD_KEY R-03" in text,
+          "and lists each row with its key and the state that wrote it  "
+          "<-- pinned defect")
+    check(len(findings) == 1 and "ROADS: 4 edit(s) saved in OWNER.SANDBOX "
+          "were never posted to OWNER.EDITS" in findings[0],
+          "saved edits that never posted are a finding, not a clean run  "
+          "<-- pinned defect")
+    lines, findings = unposted_report(ex_nv, "OWNER.SANDBOX", None, 100)
+    check("    inserted 101  written at state 12" in "\n".join(lines),
+          "without a key field the row line carries no key")
+    lines, findings = unposted_report(ex_nv, "OWNER.SANDBOX", None, 1)
+    text = "\n".join(lines)
+    check("    ... and 3 more. --rows 0 lists every row" in text
+          and "    deleted" not in text,
+          "a row cap says how many rows it left out, never silently")
+    lines, findings = unposted_report(ex_nv, "OWNER.SANDBOX", None, 0)
+    check("... and" not in "\n".join(lines),
+          "a cap of 0 lists every row")
+
+    # The parent reloaded: it deleted roads 2 and 3 as well, so those two
+    # deletes have nothing left to post.
+    lines, findings = unposted_report(ex, "OWNER.SANDBOX", None, 100)
+    text = "\n".join(lines)
+    check("unposted              2 row(s): 1 inserted, 1 updated, 0 deleted"
+          in text and "already in the parent 2, edited and put back 0"
+          in text, "an owner delete the parent already made is not unposted")
+
+    # The parent resurfaced road 4 while the owner repaved it.
+    clash_dir = export("clash_before", tree, versions,
+                       shared_adds + own_adds + [(4, 2, "R-04", "Road 4",
+                                                  "CHIPSEAL")],
+                       shared_dels + own_dels + [(4, 0, 2)])
+    lines, findings = unposted_report(
+        load_export(clash_dir, DEFAULT_OID_FIELD, None), "OWNER.SANDBOX",
+        None, 100)
+    check("    updated  4  written at state 11  (the parent also edited it "
+          "since the ancestor)" in "\n".join(lines),
+          "an unposted row the parent also edited says so")
+
+    # The parent made the owner's insert itself, and the owner put road 5
+    # back to what it was.
+    same_dir = export("held_before", tree, versions,
+                      shared_adds + own_adds + [(101, 2, "R-101", "Road 101",
+                                                 "PAVED"),
+                                                (5, 12, "R-05", "Road 5",
+                                                 "DIRT")],
+                      shared_dels + own_dels + [(5, 0, 12)])
+    lines, findings = unposted_report(
+        load_export(same_dir, DEFAULT_OID_FIELD, None), "OWNER.SANDBOX",
+        None, 100)
+    text = "\n".join(lines)
+    check("unposted              3 row(s): 0 inserted, 1 updated, 2 deleted"
+          in text and "already in the parent 1, edited and put back 1"
+          in text,
+          "an insert the parent holds, and an edit put back, are counted "
+          "and not listed")
+
+    # States with no edit that any exported table shows.
+    idle_states_dir = export("idle_states", tree, versions, [], [])
+    lines, findings = unposted_report(
+        load_export(idle_states_dir, DEFAULT_OID_FIELD, None),
+        "OWNER.SANDBOX", None, 100)
+    check(len(findings) == 1 and "holds 3 state(s) the parent does not, and "
+          "no exported table shows an edit in them" in findings[0]
+          and "cannot tell which" in findings[0],
+          "states that hold no visible edit are a finding, not a clean "
+          "run  <-- pinned defect")
+
+    # Posted: the parent holds the sandbox's state, so nothing is left.
+    ex_posted = load_export(posted_dir, DEFAULT_OID_FIELD, None)
+    lines, findings = unposted_report(ex_posted, "OWNER.SANDBOX", None, 100)
+    check(findings == [] and "nothing to post: the parent holds every state "
+          "of the version" in "\n".join(lines),
+          "a version the parent already holds has nothing to post")
+
+    lines, findings = unposted_tree(ex_nv, "OWNER.SANDBOX", None, 100, False)
+    check("nested version" not in "\n".join(lines) and len(findings) == 1,
+          "without --tree only the named version is listed")
+    lines, findings = unposted_tree(ex_nv, "OWNER.SANDBOX", None, 100, True)
+    text = "\n".join(lines)
+    check(len(findings) == 3 and "nested version OWNER.CHILD" in text
+          and "    inserted 102  written at state 13" in text
+          and "nested version OWNER.GRAND" in text
+          and "    deleted  5" in text,
+          "--tree lists the unposted rows of every nested version against "
+          "its own parent")
+    check(unchecked_note(ex_nv, "OWNER.SANDBOX", False) ==
+          " 2 nested version(s) under OWNER.SANDBOX, 0 behind their parent, "
+          "are not part of this verdict. Add --tree." and unchecked_note(ex_nv, "OWNER.SANDBOX", True) == ""
+          and unchecked_note(ex_nv, "OWNER.GRAND", False) == "",
+          "a verdict says when nested versions were not looked at")
+
+    # After a no-post reconcile of the sandbox. The sandbox moved to state 20
+    # and the child did not, so the child's lineage lacks state 20.
+    nv_after_tree = nv_tree + [(20, 2)]
+    nv_after_versions = [("SDE.DEFAULT", 0, ""),
+                         ("OWNER.EDITS", 2, "SDE.DEFAULT"),
+                         ("OWNER.SANDBOX", 20, "OWNER.EDITS"),
+                         ("OWNER.CHILD", 13, "OWNER.SANDBOX"),
+                         ("OWNER.GRAND", 14, "OWNER.CHILD")]
+    nv_after_adds = (shared_adds + own_adds + quiet_adds + child_adds +
+                     redo_adds)
+    nv_after_dels = (shared_dels + own_dels + quiet_dels + grand_dels +
+                     redo_quiet)
+    nv_after_dir = export("nested_after", nv_after_tree, nv_after_versions,
+                          nv_after_adds, nv_after_dels, good_view)
+    ex_nva = load_export(nv_after_dir, DEFAULT_OID_FIELD, None)
+    check(behind(ex_nva, subtree(ex_nva["versions"], "OWNER.SANDBOX")) ==
+          [("OWNER.CHILD", "OWNER.SANDBOX", 13, 20)],
+          "a child the reconcile did not reach is behind its parent; the "
+          "grandchild still holds the child's state")
+    lines, findings = verify(snap_quiet, ex_nva, "OWNER.SANDBOX", 10)
+    check(findings == [] and "nested versions        2, 1 behind their "
+          "parent" in "\n".join(lines),
+          "without --tree verify counts the nested versions and stays "
+          "quiet")
+    lines, findings = verify(snap_quiet, ex_nva, "OWNER.SANDBOX", 10, True)
+    check(len(findings) == 1 and findings[0].startswith(
+        "OWNER.CHILD: behind its parent OWNER.SANDBOX. Its state 13 does "
+        "not hold state 20") and "ran before the parent moved" in findings[0],
+          "with --tree a nested version a reconcile skipped is a finding  "
+          "<-- pinned defect")
+    lines, findings = unposted_tree(ex_nva, "OWNER.SANDBOX", None, 100, True)
+    text = "\n".join(lines)
+    check(len(findings) == 4 and findings[-1].startswith("OWNER.CHILD: "
+                                                         "behind")
+          and "already in the parent 4" in text
+          and "    inserted 102  written at state 13" in text,
+          "after a no-post reconcile the sandbox's edits are still unposted, "
+          "and the child's older copies of them count as already held")
+
+    # A tree that was reconciled top down holds at every level.
+    top_tree = nv_after_tree + [(21, 20), (22, 21)]
+    top_versions = nv_after_versions[:3] + [
+        ("OWNER.CHILD", 21, "OWNER.SANDBOX"),
+        ("OWNER.GRAND", 22, "OWNER.CHILD")]
+    top_dir = export("nested_top", top_tree, top_versions, nv_after_adds,
+                     nv_after_dels, good_view)
+    ex_top = load_export(top_dir, DEFAULT_OID_FIELD, None)
+    check(behind(ex_top, subtree(ex_top["versions"], "OWNER.SANDBOX")) == [],
+          "a tree reconciled top down is behind nowhere")
+    check(verify(snap_quiet, ex_top, "OWNER.SANDBOX", 10, True)[1] == [],
+          "and --tree finds nothing in it")
+
     # ---- the command line
     def run_cli(argv):
         out, err = io.StringIO(), io.StringIO()
@@ -1160,6 +1547,91 @@ def self_test():
     finally:
         sys.argv = argv_before
 
+    # ---- unposted rows and nested versions, through main
+    before_files = sorted(os.listdir(quiet_dir)) + sorted(os.listdir(tmp))
+    code, out, err = run_cli([quiet_dir] + sv + ["--unposted"])
+    check(code == 1 and out.startswith("reconverify unposted: ")
+          and "unposted              4 row(s): 1 inserted, 1 updated, 2 "
+          "deleted" in out and "    inserted 101  written at state 12" in out
+          and "VERDICT: 1 finding(s). Saved edits did not post, or the tool "
+          "could not tell." in out,
+          "--unposted lists the saved edits that never posted and exits 1  "
+          "<-- pinned defect")
+    check(before_files == sorted(os.listdir(quiet_dir)) + sorted(
+        os.listdir(tmp)), "--unposted writes no file")
+    code, out, err = run_cli([quiet_dir] + sv + ["--unposted", "--key-field",
+                                                  "ROAD_KEY", "--rows", "1"])
+    check(code == 1 and "ROAD_KEY R-04" not in out
+          and "    ... and 3 more. --rows 0 lists every row" in out,
+          "--rows caps the list and says what it left out")
+    code, out, err = run_cli([posted_dir] + sv + ["--unposted"])
+    check(code == 0 and "nothing to post" in out and "VERDICT: no unposted "
+          "edit in the exported tables." in out,
+          "--unposted on a version the parent holds exits 0")
+    code, out, err = run_cli([nv_dir] + sv + ["--unposted"])
+    check(code == 1 and "nested version OWNER" not in out
+          and "VERDICT: 1 finding(s). Saved edits did not post, or the tool "
+          "could not tell. 2 nested version(s) under OWNER.SANDBOX, 0 behind "
+          "their parent, are not part of this verdict. Add --tree." in out,
+          "--unposted without --tree says it left the nested versions "
+          "unchecked  <-- pinned defect")
+    code, out, err = run_cli([nv_dir] + sv + ["--unposted", "--tree"])
+    check(code == 1 and "VERDICT: 3 finding(s)." in out
+          and "nested version OWNER.GRAND" in out
+          and "not part of this verdict" not in out,
+          "--unposted --tree covers the whole tree")
+    code, out, err = run_cli([nv_dir, "--edit-version", "OWNER.GRAND",
+                              "--unposted"])
+    check(code == 1 and "deleted  5" in out and "nested version" not in out,
+          "a nested version can be the one named")
+    code, out, err = run_cli([idle_states_dir] + sv + ["--unposted"])
+    check(code == 1 and "cannot tell which" in out,
+          "states with no visible edit exit 1, not 0")
+    code, out, err = run_cli([quiet_dir, "--edit-version", "OWNER.NOBODY",
+                              "--unposted"])
+    check(code == 3, "--unposted on a version that is not exported exits 3")
+    code, out, err = run_cli([os.path.join(tmp, "nowhere")] + sv +
+                             ["--unposted"])
+    check(code == 2, "--unposted on a directory that does not exist exits 2")
+
+    verify_nv = [nv_after_dir] + sv + ["--before", snap_path]
+    code, out, err = run_cli(verify_nv)
+    check(code == 0 and "nested versions        2, 1 behind their parent"
+          in out and "VERDICT: verified from a fresh read." in out
+          and "2 nested version(s) under OWNER.SANDBOX, 1 behind their "
+          "parent, are not part of this verdict. Add --tree." in out,
+          "verify with nested versions exits 0 and says it did not check "
+          "them  <-- pinned defect")
+    code, out, err = run_cli(verify_nv + ["--tree"])
+    check(code == 1 and "FINDING  OWNER.CHILD: behind its parent "
+          "OWNER.SANDBOX" in out and "VERDICT: 1 finding(s). The reconcile "
+          "is not verified." in out and "not part of this verdict" not in out,
+          "verify --tree exits 1 for a nested version the reconcile skipped")
+    code, out, err = run_cli([top_dir] + sv + ["--before", snap_path,
+                                               "--tree"])
+    check(code == 0 and "nested versions        2, 0 behind their parent"
+          in out, "verify --tree on a reconciled tree exits 0")
+    code, out, err = run_cli([nv_dir] + sv)
+    check(code == 0 and "nested versions        2: OWNER.CHILD, OWNER.GRAND"
+          in out, "the plan lists the nested versions and exits as before")
+
+    for argv, label in (
+            ([quiet_dir] + sv + ["--unposted", "--before", snap_path],
+             "--unposted with --before exits 64"),
+            ([quiet_dir] + sv + ["--unposted", "--snapshot", "x"],
+             "--unposted with --snapshot exits 64"),
+            ([quiet_dir] + sv + ["--unposted", "--snapshot", "x", "--apply"],
+             "--unposted with --apply exits 64"),
+            ([quiet_dir] + sv + ["--rows", "5"],
+             "--rows without --unposted exits 64"),
+            ([quiet_dir] + sv + ["--unposted", "--rows", "-1"],
+             "a negative --rows exits 64"),
+            ([quiet_dir] + sv + ["--tree"],
+             "--tree on a plan exits 64, not a silent no-op")):
+        check(run_cli(argv)[0] == 64, label)
+    check(run_cli([quiet_dir] + sv + ["--unp"])[0] == 64,
+          "a unique prefix --unp is refused too  <-- pinned defect")
+
     # ---- the harness itself
     quiet = sys.stdout
     sys.stdout = io.StringIO()
@@ -1242,6 +1714,16 @@ def _parse(argv):
     ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE,
                     help="object ids listed per finding (default %d)"
                          % DEFAULT_SAMPLE)
+    ap.add_argument("--unposted", action="store_true",
+                    help="list, row by row, the edits the version holds that "
+                         "its parent does not. Reads one export, writes "
+                         "nothing")
+    ap.add_argument("--tree", action="store_true",
+                    help="with --unposted or --before, also cover every "
+                         "version nested under --edit-version")
+    ap.add_argument("--rows", type=int, default=None,
+                    help="with --unposted, rows listed per table (default %d,"
+                         " 0 lists every row)" % DEFAULT_ROWS)
     ap.add_argument("--apply", action="store_true",
                     help="write the --snapshot file. Nothing else writes")
     ap.add_argument("--self-test", action="store_true",
@@ -1271,21 +1753,39 @@ def main(argv=None):
         return usage("--sample cannot be negative.")
     if args.apply and not args.snapshot:
         return usage("--apply needs --snapshot. Nothing else writes.")
+    if args.rows is not None and args.rows < 0:
+        return usage("--rows cannot be negative.")
+    if args.rows is not None and not args.unposted:
+        return usage("--rows needs --unposted.")
+    if args.unposted and (args.before or args.snapshot or args.apply):
+        return usage("--unposted reads one export and writes nothing. It "
+                     "takes no --before, --snapshot or --apply.")
+    if args.tree and not (args.before or args.unposted):
+        return usage("--tree needs --before or --unposted.")
     if args.before and (args.snapshot or args.oid_field or args.key_field):
         # The snapshot carries the fields it was taken with. A different key
         # here would compare two reads that were never comparable.
         return usage("--before takes no --snapshot, --oid-field or "
                      "--key-field. The snapshot carries its own.")
 
+    note = ""
     try:
-        if args.before:
+        if args.unposted:
+            oid_field = args.oid_field or DEFAULT_OID_FIELD
+            export = load_export(args.export, oid_field, args.key_field)
+            lines, findings = unposted_tree(
+                export, args.edit_version, args.key_field,
+                DEFAULT_ROWS if args.rows is None else args.rows, args.tree)
+            note = unchecked_note(export, args.edit_version, args.tree)
+        elif args.before:
             with open(args.before, "r", encoding="utf-8") as handle:
                 snap = json.load(handle)
             check_snapshot(snap)
             export = load_export(args.export, snap["oid_field"],
                                  snap["key_field"])
             lines, findings = verify(snap, export, args.edit_version,
-                                     args.sample)
+                                     args.sample, args.tree)
+            note = unchecked_note(export, args.edit_version, args.tree)
         else:
             oid_field = args.oid_field or DEFAULT_OID_FIELD
             export = load_export(args.export, oid_field, args.key_field)
@@ -1298,17 +1798,22 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    print("reconverify %s: %s" % ("verify" if args.before else "plan",
-                                  args.export))
+    print("reconverify %s: %s" % (
+        "unposted" if args.unposted else "verify" if args.before else "plan",
+        args.export))
     for line in lines:
         print(line)
     for finding in findings:
         print("FINDING  %s" % finding)
-    if args.before:
-        print("VERDICT: %d finding(s). The reconcile is not verified."
-              % len(findings) if findings else
+    if args.unposted:
+        print("VERDICT: %d finding(s). Saved edits did not post, or the tool "
+              "could not tell.%s" % (len(findings), note) if findings else
+              "VERDICT: no unposted edit in the exported tables.%s" % note)
+    elif args.before:
+        print("VERDICT: %d finding(s). The reconcile is not verified.%s"
+              % (len(findings), note) if findings else
               "VERDICT: verified from a fresh read. Own edits intact, nothing "
-              "posted, no reload.")
+              "posted, no reload.%s" % note)
     else:
         print("VERDICT: %d finding(s). Explain each before you reconcile."
               % len(findings) if findings else

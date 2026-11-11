@@ -2,7 +2,8 @@
 
 Verify a no-post reconcile of a traditionally versioned table from a fresh read. It rebuilds the
 version's view from exported copies of the state tree and the delta tables, so the check never
-asks the process that ran the reconcile whether the reconcile worked.
+asks the process that ran the reconcile whether the reconcile worked. It also lists, row by row,
+the saved edits that never posted, and it flags nested versions that a reconcile did not reach.
 
 A sandbox version holds the compress back, so a tech reconciles it with its parent and does not
 post it. The edits are supposed to stay in the sandbox, the parent is supposed to stay as it was,
@@ -18,6 +19,14 @@ A second trap sits under the first. The usual way to find "the owner's edits" is
 version's head state. A sandbox is edited over many states. The head state holds the last of
 them, and the earlier deletes and updates are invisible to a head-state read. In the demo below,
 a head-state read sees 1 of the 4 edits.
+
+A third trap hides in the word clean. A version holds saved edits that nobody posted. The table
+loads and the rows are there, so nothing looks wrong, yet the parent does not hold the edits. A
+sandbox can also have versions nested under it. Reconciling the sandbox updates the sandbox, and
+Esri's pages do not say that it reaches the versions nested under it. A run that covered only the
+sandbox can look finished while a child version is still behind. This tool lists the unposted
+rows from one fresh export, and it reads the state tree to find each nested version that no
+reconcile has reached since its parent moved.
 
 ```
 $ python reconverify.py --self-test
@@ -49,15 +58,28 @@ PASS  a parent that made the same edit as the owner is not a post  <-- pinned de
 ...
 PASS  verifying against the snapshot's own export is refused  <-- pinned defect
 ...
+PASS  and lists each row with its key and the state that wrote it  <-- pinned defect
+PASS  saved edits that never posted are a finding, not a clean run  <-- pinned defect
+...
+PASS  states that hold no visible edit are a finding, not a clean run  <-- pinned defect
+...
+PASS  with --tree a nested version a reconcile skipped is a finding  <-- pinned defect
+...
 PASS  a unique prefix --ap is refused, not expanded  <-- pinned defect
+...
+PASS  --unposted without --tree says it left the nested versions unchecked  <-- pinned defect
+...
+PASS  verify with nested versions exits 0 and says it did not check them  <-- pinned defect
+...
+PASS  a unique prefix --unp is refused too  <-- pinned defect
 ...
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-124 assertions, 0 failed
+173 assertions, 0 failed
 ```
 
-The full run prints all 124 assertions. Each `...` line above is where this block is cut.
+The full run prints all 173 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -71,20 +93,30 @@ read of the geodatabase, so it cannot show that a reload from the parent grew th
 that a post happened through some other session. This tool reads after the fact, from exports
 taken by a different query.
 
-On 2026-10-13 `gh search repos reconverify` returned only this repository. A second search, for
-"reconcile verify versioned geodatabase", returned nothing. That shows no equivalent was found
-on GitHub, not that none exists.
+For the unposted edits, Esri's Differences view (the Version Changes command) is the tool to
+reach for. Esri says it lists the changes "made to the version from the time it and the chosen
+target version were identical", as Insert, Delete and Update, and that it "lists the modified
+layers and the features that were edited in those layers"
+([View traditional version changes](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/using-the-version-changes-command.html)).
+It does that inside Pro, for a version you are connected to, and each feature shows its Current, Target and
+Common Ancestor values. The page does not say whether the differences can be exported or scripted.
+This tool adds a different thing: a list you can diff and keep from an export, an exit code, a
+count of the edits the parent already holds, and a check of every nested version in the same run.
+
+On 2026-11-10 `gh search repos reconverify` returned only this repository. Two more searches,
+"versioned geodatabase unposted edits" and "reconcile post verify versions arcgis", returned
+nothing. That shows no equivalent was found on GitHub, not that none exists.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 124 assertions, line for line, on Windows (Python 3.13.2) and on
-Ubuntu (Python 3.12.3). `coverage run --branch reconverify.py --self-test` reports 100 percent
-of lines and branches on Windows. Coverage is not installed on the Ubuntu host, so it was not
-measured there. Python 3.9 was not available on the machine that ran the last test round. The
-code uses nothing newer than 3.9, but that is a reading of the code, not a run.
+The self-test prints the same 173 assertions, line for line, on Windows (Python 3.13.2), on
+Windows under Python 3.9.25, on Windows under Python 3.12, and on Ubuntu (Python 3.12.3).
+`coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
+Windows (915 statements, 196 branches). Coverage is not installed on the Ubuntu host, so it was
+not measured there.
 
 ```
 git clone https://github.com/uhsear/reconverify.git
@@ -119,18 +151,17 @@ parent version were identical"
 
 Three things about the exports are not guaranteed, and the tool enforces what it can:
 
-- **The version table needs a parent name in the same form as the name.** The 9.3 documentation
-  for the SQL Server version table lists `name`, `owner`, `state_id`, `parent_name` and
-  `parent_owner` (I read this through a search summary of Esri's 9.3 PDF, not from the PDF
-  itself, and it is old). Name and owner are separate columns, so build `OWNER.NAME` yourself.
-  Something like this, which has not been run against a live server:
-
-  ```
-  SELECT owner + '.' + name AS name, state_id,
-         parent_owner + '.' + parent_name AS parent_name
-  FROM sde.SDE_versions
-  ```
-
+- **The version table needs a parent name in the same form as the name.** Esri's system table
+  page for the geodatabase says the versions table holds "a name, owner, status (public or
+  private), state ID, and description", and the states table holds the "state ID of the parent
+  state"
+  ([System tables, 10.0](https://help.arcgis.com/en/geodatabase/10.0/sdk/arcsde/concepts/schemaobjects/tables/systemtables.htm)).
+  That page does not name a parent version column. I could not confirm one from Esri's current
+  pages, so this repository gives no SQL for it. Look at the columns of your own versions table
+  (`SELECT TOP 1 * FROM sde.SDE_versions` on SQL Server), and build `OWNER.NAME` for the name and
+  for the parent name yourself. Esri says the system tables may be viewed with SQL and must not
+  be altered with anything but ArcGIS software
+  ([System tables in PostgreSQL](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-postgresql/geodatabase-system-tables-postgresql.html)).
   The default version has no parent and should export an empty `parent_name`. A version name
   must appear once, and the tool refuses a duplicate. Names are matched as written, so
   `owner.sandbox` does not find `OWNER.SANDBOX`.
@@ -151,6 +182,9 @@ python reconverify.py before/ --edit-version OWNER.SANDBOX
 python reconverify.py before/ --edit-version OWNER.SANDBOX --key-field ROAD_KEY
 python reconverify.py before/ --edit-version OWNER.SANDBOX --snapshot s.json --apply
 python reconverify.py after/ --edit-version OWNER.SANDBOX --before s.json
+python reconverify.py after/ --edit-version OWNER.SANDBOX --before s.json --tree
+python reconverify.py now/ --edit-version OWNER.SANDBOX --unposted
+python reconverify.py now/ --edit-version OWNER.SANDBOX --unposted --tree
 ```
 
 | Flag | Default | What it does |
@@ -162,12 +196,18 @@ python reconverify.py after/ --edit-version OWNER.SANDBOX --before s.json
 | `--oid-field` | `OBJECTID` | The object id column of the exported tables. |
 | `--key-field` | off | A business key that survives a reload. It makes the reload count exact. |
 | `--sample` | `10` | How many object ids are listed after a finding. `0` lists none. |
+| `--unposted` | off | List the edits the version holds that its parent does not, row by row. Reads one export. Writes nothing. |
+| `--tree` | off | With `--unposted` or `--before`, also cover every version nested under `--edit-version`. |
+| `--rows` | `100` | With `--unposted`, rows listed per table. `0` lists every row. |
 | `--apply` | off | Write the `--snapshot` file. Nothing else writes. |
 | `--self-test` | off | Run the assertions and exit. |
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--ap` is refused
 with exit 64 instead of being read as `--apply`, and `--snap` and `--bef` are refused the same
 way. A snapshot is never overwritten. Delete or move the old file first.
+
+`--unposted` takes no `--before`, `--snapshot` or `--apply`. `--rows` needs `--unposted`, and
+`--tree` needs `--unposted` or `--before`. A flag that would do nothing is a usage error, exit 64.
 
 `--before` takes no `--snapshot`, `--oid-field` or `--key-field`. The snapshot carries the fields
 it was taken with, and a different key would compare two reads that were never comparable.
@@ -282,6 +322,114 @@ $ python reconverify.py before_quiet --edit-version OWNER.SANDBOX --before snap.
 refused: every file in this export is byte for byte the export the snapshot was taken from. That is the same read, not a fresh one. Export again after the reconcile
 ```
 
+## Unposted rows: what never posted
+
+`--unposted` reads one export, taken now, and lists what the version holds that its parent does
+not. The headline comes from the state tree: how many states of the version the parent lacks.
+The list comes from the rows. An own edit is listed when the parent does not hold it:
+
+- an inserted row, when the parent has no identical row,
+- an updated row, when the parent's row differs from the version's,
+- a deleted row, when the parent still holds it.
+
+An own edit is counted and not listed when the parent already holds the same row, or has already
+deleted the row, or when the owner edited a row and put it back to its content at the ancestor.
+A row the parent also edited since the ancestor says so. That is a conflict waiting for the post.
+
+```
+$ python reconverify.py nested_before --edit-version OWNER.SANDBOX --unposted --key-field ROAD_KEY
+reconverify unposted: nested_before
+version OWNER.SANDBOX at state 12, parent OWNER.EDITS at state 2, common ancestor 1
+  states the parent does not hold  3
+table ROADS
+  unposted              4 row(s): 1 inserted, 1 updated, 2 deleted
+  already in the parent 0, edited and put back 0
+    inserted 101  ROAD_KEY R-101  written at state 12
+    updated  4  ROAD_KEY R-04  written at state 11
+    deleted  2  ROAD_KEY R-02
+    deleted  3  ROAD_KEY R-03
+FINDING  ROADS: 4 edit(s) saved in OWNER.SANDBOX were never posted to OWNER.EDITS. The rows are listed above
+VERDICT: 1 finding(s). Saved edits did not post, or the tool could not tell. 2 nested version(s) under OWNER.SANDBOX, 0 behind their parent, are not part of this verdict. Add --tree.
+```
+
+The verdict carries a sentence for the nested versions the run did not look at. The sandbox above
+has two, so the sentence names them. After a no-post reconcile the sandbox's edits are still
+unposted, so this list is the one to read when you ask "did anything post?". A version that the
+parent holds in full has nothing to post:
+
+```
+$ python reconverify.py posted_after --edit-version OWNER.SANDBOX --unposted
+reconverify unposted: posted_after
+version OWNER.SANDBOX at state 20, parent OWNER.EDITS at state 20, common ancestor 20
+  nothing to post: the parent holds every state of the version
+VERDICT: no unposted edit in the exported tables.
+```
+
+A version whose states hold no edit that any exported table shows is a finding. The tool cannot
+tell an empty state from an edit in a table that it was not given, so it does not say clean:
+
+```
+$ python reconverify.py idle_states --edit-version OWNER.SANDBOX --unposted
+reconverify unposted: idle_states
+version OWNER.SANDBOX at state 12, parent OWNER.EDITS at state 2, common ancestor 1
+  states the parent does not hold  3
+table ROADS
+  unposted              0 row(s): 0 inserted, 0 updated, 0 deleted
+  already in the parent 0, edited and put back 0
+FINDING  OWNER.SANDBOX: holds 3 state(s) the parent does not, and no exported table shows an edit in them. The edits sit in a table that was not exported, or the states hold none. The tool cannot tell which
+VERDICT: 1 finding(s). Saved edits did not post, or the tool could not tell.
+```
+
+The list is capped at `--rows` rows per table, and the output says how many rows it left out.
+`--rows 0` lists every row.
+
+## Nested versions: what a reconcile skipped
+
+The version tree comes from the parent names in `versions.csv`. A version nested under the one you
+name is a child, a grandchild and so on. Esri defines a child version as "the enterprise
+geodatabase version that was created from another version"
+([Versioning vocabulary](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/versioning-vocabulary.html)).
+
+Esri's Reconcile Versions page describes the edit version as the one "reconciled with the selected
+target version", and says its dialog shows versions only in that ancestry: "Only versions that
+are in the direct ancestry of the selected target version will be displayed"
+([Reconcile Versions](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/reconcile-versions.html)).
+It does not say whether the `ALL_VERSIONS` mode reaches versions nested under a version that is
+not the target. The tool therefore does not assume. It reads the outcome. A nested version is
+behind when its state lineage does not hold the state its parent now points at. That means no
+reconcile of it has run since the parent moved. Esri says a post needs the target to be
+unchanged since the last reconcile: "You can only post changes if the target version has not been
+modified since you last reconciled changes"
+([Reconcile and post edits to a traditional version](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/reconcile-and-post-edits-to-a-version.html)).
+By that rule, a child that is behind cannot post to its parent until it reconciles again.
+
+Without `--tree`, `verify` and `--unposted` print the count and say, in the verdict, that the
+nested versions are not part of it. With `--tree`, each version that is behind is a finding, and
+`--unposted` lists the unposted rows of every nested version against its own parent. The plan
+names the nested versions and does not judge them. They are judged after the reconcile.
+
+```
+$ python reconverify.py nested_after --edit-version OWNER.SANDBOX --before snap.json
+...
+nested versions        2, 1 behind their parent
+VERDICT: verified from a fresh read. Own edits intact, nothing posted, no reload. 2 nested version(s) under OWNER.SANDBOX, 1 behind their parent, are not part of this verdict. Add --tree.
+
+$ python reconverify.py nested_after --edit-version OWNER.SANDBOX --before snap.json --tree
+...
+nested versions        2, 1 behind their parent
+FINDING  OWNER.CHILD: behind its parent OWNER.SANDBOX. Its state 13 does not hold state 20, where the parent now points. A reconcile run did not reach it, or ran before the parent moved
+VERDICT: 1 finding(s). The reconcile is not verified.
+```
+
+A tree reconciled top down, the sandbox first and then each child in turn, holds at every level:
+
+```
+$ python reconverify.py nested_top --edit-version OWNER.SANDBOX --before snap.json --tree
+...
+nested versions        2, 0 behind their parent
+VERDICT: verified from a fresh read. Own edits intact, nothing posted, no reload.
+```
+
 ## Nothing writes without --apply
 
 The only file the tool writes is the snapshot, and only with `--apply`:
@@ -306,7 +454,7 @@ treat the snapshot as sensitive as that column.
 | Code | Meaning |
 |---|---|
 | 0 | Nothing found. |
-| 1 | At least one finding. |
+| 1 | At least one finding. With `--unposted`, an unposted edit, a nested version that is behind, or an export the tool could not read an edit from. |
 | 2 | A file could not be read or written, including a snapshot that already exists. |
 | 3 | Refused. The export is not a usable state tree, the after export is the snapshot's own read, a file is not UTF-8, or the snapshot is unusable. |
 | 64 | Usage error, including an unknown or abbreviated flag. |
@@ -316,9 +464,9 @@ the tool could not make sense of its input.
 
 ## Limits
 
-- The export contract is hand-built. The SQL above has not run against a live server, and the
-  column names come from Esri's 9.3 documentation, which I could not re-read from the source.
-  Check them against your release.
+- The export contract is hand-built. No SQL in this repository has run against a live server. The
+  parent column of the versions table is not named on any Esri page I could read, so you build
+  `parent_name` from your own release. The delta table column names come from Esri's 10.0 pages.
 - A post is read from the state tree when the plan saw an edit. A version with no edits at the
   plan cannot be shown to have posted, and a sandbox with no edits verifies as `0 of 0`, exit 0.
 - The post test assumes a post leaves the parent holding the version's head state. Esri says only
@@ -358,8 +506,27 @@ the tool could not make sense of its input.
 - If the disk fills while the snapshot is being written, a partial file can remain, and the next
   run then refuses to overwrite it. The text is built in memory first, so only the write itself
   can fail.
-- Line coverage is 100 percent on Windows. The one test that times itself (a 30,000-state chain,
+- Line and branch coverage is 100 percent on Windows and was not measured on Ubuntu. The one test that times itself (a 30,000-state chain,
   under 3 seconds) can fail on a very slow machine.
+- `--unposted` reads one export and has no snapshot to compare it with, so it cannot tell a stale
+  export from a fresh one. Export it by a query of its own, after the last edit you care about.
+  This tool never starts a child process or opens a geodatabase. The fresh read is the export you
+  make, and no exporter is included, because the one in Pro needs `arcpy`.
+- An unposted row is a row the parent does not hold in the same text form. A parent row that
+  matches by chance counts as already held. A row the owner inserted and then deleted inside the
+  version leaves no trace, so it is neither listed nor counted.
+- A version with states since the ancestor and no edit in any exported table is a finding. The
+  tool cannot tell an edit in a table it was not given from a state that holds no edit. A sandbox
+  that was reconciled with nothing to carry can therefore exit 1 under `--unposted`.
+- A nested version is behind when its lineage lacks its parent's head state. The tool cannot know
+  whether the run was meant to reach it, so a child that you left alone on purpose is reported
+  when you pass `--tree`. That a reconcile leaves the parent's head in the version's own lineage
+  is the tool's model of the state tree, shown on synthetic exports and not on a live server.
+- Esri's pages do not say whether `ALL_VERSIONS` reaches versions nested under a version that is
+  not the target. This repository did not run the Esri tool, so it makes no claim about what that
+  tool did on any run. It checks the outcome that the exports show.
+- The Differences view lists changes against a chosen target. This tool compares a version only
+  with its own parent.
 
 ## Contributing
 
