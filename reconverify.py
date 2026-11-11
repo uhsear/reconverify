@@ -178,8 +178,9 @@ def resolve(export, version):
         raise ValueError("version %s is not in versions.csv" % version)
     head, parent = versions[version]
     if parent not in versions:
-        raise ValueError("the parent %r of %s is not in versions.csv"
-                         % (parent, version))
+        raise ValueError("the parent %r of %s is not in versions.csv. A version "
+                         "with no parent, such as the default version, "
+                         "cannot be checked" % (parent, version))
     parent_head = versions[parent][0]
     return (head, parent, parent_head,
             common_ancestor(export["parents"], head, parent_head))
@@ -473,8 +474,9 @@ def plan(export, version, oid_field, key_field, sample):
              "%d" % (version, head, parent, parent_head, ancestor)]
     nested = subtree(export["versions"], version)
     if nested:
-        lines.append("nested versions        %d: %s. Check them after the "
-                     "reconcile with --tree" % (len(nested), ", ".join(
+        lines.append("nested versions        %d: %s. After the "
+                     "reconcile, verify counts them. --unposted --tree "
+                     "lists their rows" % (len(nested), ", ".join(
                          c for c, _ in nested)))
     findings = []
     snap = {"format": FORMAT, "version": version, "parent": parent,
@@ -1026,7 +1028,8 @@ def self_test():
     raises(lambda: plan(ex, "OWNER.NOBODY", "OBJECTID", None, 10),
            "a version not in versions.csv is refused")
     raises(lambda: plan(ex, "SDE.DEFAULT", "OBJECTID", None, 10),
-           "DEFAULT has no parent to reconcile with, and is refused")
+           "DEFAULT has no parent to reconcile with, and is refused",
+           "the default version, cannot be checked")
 
     # ---- after the reconcile. The sandbox now points at state 20, a child
     # of the parent's state 2, which holds the own edits again.
@@ -1419,8 +1422,9 @@ def self_test():
           "before the reconcile no nested version is behind its parent")
 
     lines, findings, _ = plan(ex_nv, "OWNER.SANDBOX", "OBJECTID", None, 10)
-    check("nested versions        2: OWNER.CHILD, OWNER.GRAND. Check them "
-          "after the reconcile with --tree" in "\n".join(lines),
+    check("nested versions        2: OWNER.CHILD, OWNER.GRAND. After the "
+          "reconcile, verify counts them. --unposted --tree lists their "
+          "rows" in "\n".join(lines),
           "the plan names the nested versions it cannot reconcile for you")
 
     lines, findings = unposted_report(ex_nv, "OWNER.SANDBOX", "ROAD_KEY", 100)
@@ -1662,6 +1666,11 @@ def self_test():
           "the written snapshot verifies a clean reconcile, exit 0")
     check("no reload." in out and RELOAD_UNKNOWN not in out,
           "an unkeyed verify with no arrived row says no reload")
+    check("verified from a fresh read of ROADS. Own edits intact" in out
+          and "Edits made after the plan, and tables outside the snapshot, "
+          "are not covered." in out,
+          "the clean verdict names the tables it checked and what it "
+          "cannot cover  <-- pinned defect")
     arrive_dir = export("arrive_after", after_tree, after_versions,
                         shared_adds + own_adds + quiet_adds + redo_adds + [
                             (310 + n, 2, "R-%d" % (310 + n), "Road", "DIRT")
@@ -1988,7 +1997,8 @@ def _parse(argv):
         prog="reconverify.py",
         description="Verify a no-post reconcile of a traditional version "
                     "from a fresh read of its delta tables.",
-        epilog="Nothing is written without --apply.",
+        epilog="Nothing is written without --apply, except that --self-test "
+               "uses a temporary directory it removes.",
         allow_abbrev=False,
     )
     ap.add_argument("export", nargs="?", metavar="EXPORT",
@@ -2130,8 +2140,10 @@ def main(argv=None):
     elif args.before:
         print("VERDICT: %d finding(s). The reconcile is not verified.%s"
               % (len(findings), note) if findings else
-              "VERDICT: verified from a fresh read. Own edits intact, nothing "
-              "posted, %s.%s" % (
+              "VERDICT: verified from a fresh read of %s. Own edits intact, "
+              "nothing posted, %s. Edits made after the plan, and tables "
+              "outside the snapshot, are not covered.%s" % (
+                  ", ".join(sorted(snap["tables"])) or "no table",
                   "no reload signal, but rows arrived and without "
                   "--key-field a reload under new object ids cannot be "
                   "ruled out" if any(l.startswith(RELOAD_UNKNOWN)

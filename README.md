@@ -73,6 +73,7 @@ PASS  without --tree the nested rows are counted, not listed  <-- pinned defect
 ...
 PASS  a nested version a reconcile skipped is a finding, not a note  <-- pinned defect
 ...
+PASS  the clean verdict names the tables it checked and what it cannot cover  <-- pinned defect
 PASS  an unkeyed verify with arrived rows does not claim no reload  <-- pinned defect
 ...
 PASS  a plan whose version states show no own row exits 1, not 0  <-- pinned defect
@@ -94,10 +95,10 @@ PASS  the footer reports failures by count and by name, and exits 1  <-- pinned 
 PASS  importing the module prints nothing and exposes the core
 ...
 --------------------------------------------------------------------
-202 assertions, 0 failed
+203 assertions, 0 failed
 ```
 
-The full run prints all 202 assertions. Each `...` line above is where this block is cut.
+The full run prints all 203 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -130,11 +131,11 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 202 assertions, line for line, on Windows (Python 3.13.2), on
+The self-test prints the same 203 assertions, line for line, on Windows (Python 3.13.2), on
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (1025 statements, 230 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (1026 statements, 230 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -304,7 +305,7 @@ table ROADS
   own rows identical    2 of 2
   own rows in parent    0
   client read           none in the export
-VERDICT: verified from a fresh read. Own edits intact, nothing posted, no reload.
+VERDICT: verified from a fresh read of ROADS. Own edits intact, nothing posted, no reload. Edits made after the plan, and tables outside the snapshot, are not covered.
 ```
 
 A finding is raised when any of these hold:
@@ -483,12 +484,12 @@ A tree reconciled top down, the sandbox first and then each child in turn, holds
 $ python reconverify.py nested_top --edit-version OWNER.SANDBOX --before snap.json
 ...
 nested versions        2, 0 behind their parent
-VERDICT: verified from a fresh read. Own edits intact, nothing posted, no reload.
+VERDICT: verified from a fresh read of ROADS. Own edits intact, nothing posted, no reload. Edits made after the plan, and tables outside the snapshot, are not covered.
 ```
 
 ## Nothing writes without --apply
 
-The only file the tool writes is the snapshot, and only with `--apply`:
+The only file the tool writes for a real check is the snapshot, and only with `--apply`. `--self-test` is the one other writer: it makes a temporary directory of synthetic exports and removes it at the end.
 
 ```
 $ python reconverify.py before_quiet --edit-version OWNER.SANDBOX --snapshot snap.json
@@ -561,7 +562,7 @@ the tool could not make sense of its input.
 - A CSV cell larger than 128 KB, such as long geometry text, raises `csv.Error` and the run exits
   2. That is a tool failure, not a clean read, so a job must not treat exit 2 as no findings.
 - File names are matched in lower case. A table exported as `T.BASE.CSV` is not read, and a delta
-  file with an odd-case name is not flagged as stray.
+  file with an odd-case name is not flagged as stray, so the table is left out of every check.
 - Every export file is read whole into memory. Walking the lineage of a 30,000-state chain took
   about 0.005 seconds on the Windows workstation. That is not a timing of the whole export load, and a very large adds table
   is not what this is for.
@@ -599,7 +600,15 @@ the tool could not make sense of its input.
 - `--unposted` cannot see an edit in a table that it was not given. It reports the edits it sees,
   and it says so when the only ones it sees are ones the parent already holds.
 - `--edit-version` must name a version that has a parent. The default version is refused with
-  exit 3, so `--unposted` cannot sweep every version from the root.
+  exit 3 and a message that says a version with no parent cannot be checked, so `--unposted`
+  cannot sweep every version from the root.
+- `--unposted` judges the named version only by its unposted rows. It does not check whether the
+  version holds its parent's current head, so a post could still be refused when the parent moved
+  after the last reconcile. Nested versions and verify do flag that.
+- The verdict of a clean verify names the tables it checked. A table the plan did not hold is
+  not covered, and neither are the owner's edits made after the plan.
+- Every `.csv` file in the export directory is hashed and its name is recorded in the snapshot,
+  even when the tool does not use it. Keep the export directory to the export.
 - A version that moved and whose parent then moved after the reconcile lacks the parent's new
   head. The tool cannot tell a parent that moved after a good reconcile from a reconcile that ran
   too early, so it is a finding and the run exits 1. Reconcile again and export again, or plan
@@ -641,9 +650,8 @@ the tool could not make sense of its input.
   reproduced here.
 - A clean `--unposted` exit covers the named version and every nested version in the export. Without
   `--tree` the nested versions are read, but their rows are not listed.
-- The plan prints "Check them after the reconcile with --tree", but `--tree` is accepted only with
-  `--unposted`, and verify rejects it with exit 64. After a reconcile, verify counts nested versions
-  without a flag.
+- The plan names nested versions and says that verify counts them and that `--unposted --tree`
+  lists their rows. `--tree` is accepted only with `--unposted`, and verify rejects it with exit 64.
 - A reconcile that changed nothing in the exported files cannot be verified, because the
   freshness test refuses an identical export with exit 3.
 - Freshness depends on how you export. The tool reads exports and starts no child process.
