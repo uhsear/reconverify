@@ -191,6 +191,14 @@ def ids(oids, sample):
     return ", e.g. %s" % shown if shown else ""
 
 
+NO_OWN_EDIT = ("%s: holds states the parent does not, and no exported table "
+               "shows an own edit in them. The edits sit in a table that was "
+               "not exported, or the states hold none. The tool cannot tell "
+               "which. %s")
+
+RELOAD_UNKNOWN = "  reload check          "
+
+
 def reload_finding(name, deleted, parent_deleted, arrived, keys,
                    deleted_keys, changed_keys, key_field, sample):
     """Findings when rows the owner edited come back under new object ids.
@@ -521,6 +529,10 @@ def plan(export, version, oid_field, key_field, sample):
             "changed_keys": changed_keys,
             "view": sorted(v_view),
         }
+    if own and not any(t["changed"] or t["deleted"]
+                       for t in snap["tables"].values()):
+        findings.append(NO_OWN_EDIT % (
+            version, "The plan names nothing a reconcile would undo"))
     return lines, findings, snap
 
 
@@ -634,6 +646,10 @@ def verify(snap, export, version, sample):
         lines.append("  own rows identical    %d of %d"
                      % (len(changed) - len(lost), len(changed)))
         lines.append("  own rows in parent    %d" % len(posted))
+        if arrived and not key_field:
+            lines.append("%snot possible without --key-field: %d arrived "
+                         "row(s) cannot be told from ordinary parent "
+                         "inserts" % (RELOAD_UNKNOWN, len(arrived)))
         gone = [o for o in was["deleted"]
                 if posted_state and o not in p_view]
         if back:
@@ -660,6 +676,11 @@ def verify(snap, export, version, sample):
         lines.append(line)
         if found:
             findings.append(found)
+    if snap["edited"] and not any(t["changed"] or t["deleted"]
+                                  for t in snap["tables"].values()):
+        findings.append(NO_OWN_EDIT % (
+            version, "The verify checked no own row, so it did not verify "
+            "that the edits survived"))
     for name in sorted(export["tables"]):
         if name not in snap["tables"]:
             lines.append("table %s is in the export but not in the snapshot, "
@@ -1175,13 +1196,23 @@ def self_test():
                                 shared_dels))[2]
     lines, findings = verify_of(empty_snap, reconciled(
         "empty_posted", shared_adds, shared_dels, 20))
-    check(len(findings) == 1 and "now holds the version's own state 20. "
-          "Something posted" in findings[0],
+    check(len(findings) == 2 and any("now holds the version's own state 20. "
+                                     "Something posted" in f
+                                     for f in findings),
           "a post that no exported row shows is read from the state tree  "
           "<-- pinned defect")
-    check(verify_of(empty_snap, reconciled(
-        "empty_good", shared_adds, shared_dels))[1] == [],
-          "and an edit-free version that was not posted is clean")
+    findings = verify_of(empty_snap, reconciled(
+        "empty_good", shared_adds, shared_dels))[1]
+    check(len(findings) == 1 and "no exported table shows an own edit in "
+          "them" in findings[0] and "did not verify that the edits survived"
+          in findings[0],
+          "a version whose states show no own row is not verified clean, "
+          "whatever the verify then sees  <-- pinned defect")
+    check(plan_of(export("empty_plan", tree, versions, shared_adds,
+                         shared_dels))[1][0].endswith(
+        "The plan names nothing a reconcile would undo"),
+          "the plan says the same of such a version, not nothing found  "
+          "<-- pinned defect")
     check(len(verify_of(dict(empty_snap, edited=False), reconciled(
         "empty_noedit", shared_adds, shared_dels, 20))[1]) == 1,
           "a post is read from the state tree whatever the snapshot says "
@@ -1629,6 +1660,27 @@ def self_test():
     code, out, err = run_cli([good_dir] + sv + ["--before", snap_path])
     check(code == 0 and "VERDICT: verified from a fresh read" in out,
           "the written snapshot verifies a clean reconcile, exit 0")
+    check("no reload." in out and RELOAD_UNKNOWN not in out,
+          "an unkeyed verify with no arrived row says no reload")
+    arrive_dir = export("arrive_after", after_tree, after_versions,
+                        shared_adds + own_adds + quiet_adds + redo_adds + [
+                            (310 + n, 2, "R-%d" % (310 + n), "Road", "DIRT")
+                            for n in range(1, 10)],
+                        shared_dels + own_dels + quiet_dels + redo_quiet)
+    code, out, err = run_cli([arrive_dir] + sv + ["--before", snap_path])
+    check(code == 0 and "9 arrived" in out
+          and "no reload signal, but rows arrived and without --key-field a "
+          "reload under new object ids cannot be ruled out" in out
+          and "no reload." not in out and RELOAD_UNKNOWN in out,
+          "an unkeyed verify with arrived rows does not claim no reload  "
+          "<-- pinned defect")
+    qkey_path = os.path.join(tmp, "snap_qkey.json")
+    run_cli([quiet_dir] + sv + ["--key-field", "ROAD_KEY", "--snapshot",
+                                qkey_path, "--apply"])
+    code, out, err = run_cli([good_dir] + sv + ["--before", qkey_path])
+    check(code == 0 and "posted, no reload." in out
+          and RELOAD_UNKNOWN not in out,
+          "a keyed verify counts the reload exactly and says no reload")
     code, out, err = run_cli([lossy_dir] + sv + ["--before", snap_path])
     check(code == 1 and "FINDING" in out and "not verified" in out,
           "and fails an undone one, exit 1")
@@ -1641,6 +1693,20 @@ def self_test():
     code, out, err = run_cli([bad_dir] + sv + ["--before", key_path])
     check(code == 1 and "carry the ROAD_KEY" in out,
           "verify reads the key field from the snapshot")
+    code, out, err = run_cli([os.path.join(tmp, "empty_plan")] + sv)
+    check(code == 1 and "VERDICT: 1 finding(s). Explain each" in out
+          and "nothing found" not in out,
+          "a plan whose version states show no own row exits 1, not 0  "
+          "<-- pinned defect")
+    empty_path = os.path.join(tmp, "snap_empty.json")
+    run_cli([os.path.join(tmp, "empty_plan")] + sv + ["--snapshot",
+                                                      empty_path, "--apply"])
+    code, out, err = run_cli([os.path.join(tmp, "empty_good")] + sv + [
+        "--before", empty_path])
+    check(code == 1 and "own rows identical    0 of 0" in out
+          and "Own edits intact" not in out,
+          "and its verify exits 1, never 'own edits intact'  "
+          "<-- pinned defect")
     put(tmp, "junk.json", "{not json")
     code, out, err = run_cli([good_dir] + sv + ["--before", os.path.join(
         tmp, "junk.json")])
@@ -1798,7 +1864,8 @@ def self_test():
           "without any flag  <-- pinned defect")
     code, out, err = run_cli([top_dir] + sv + ["--before", snap_path])
     check(code == 0 and "nested versions        2, 0 behind their parent"
-          in out, "verify on a reconciled tree exits 0")
+          in out and "nothing posted, no reload." in out,
+          "verify on a reconciled tree exits 0")
     code, out, err = run_cli([nv_dir] + sv)
     check(code == 0 and "nested versions        2: OWNER.CHILD, OWNER.GRAND"
           in out, "the plan lists the nested versions and exits as before")
@@ -2064,7 +2131,11 @@ def main(argv=None):
         print("VERDICT: %d finding(s). The reconcile is not verified.%s"
               % (len(findings), note) if findings else
               "VERDICT: verified from a fresh read. Own edits intact, nothing "
-              "posted, no reload.%s" % note)
+              "posted, %s.%s" % (
+                  "no reload signal, but rows arrived and without "
+                  "--key-field a reload under new object ids cannot be "
+                  "ruled out" if any(l.startswith(RELOAD_UNKNOWN)
+                                     for l in lines) else "no reload", note))
     else:
         print("VERDICT: %d finding(s). Explain each before you reconcile."
               % len(findings) if findings else

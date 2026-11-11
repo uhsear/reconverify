@@ -48,8 +48,8 @@ PASS  a version that moved on one more edit, without the parent pulled in, is a 
 PASS  a post of delete-only edits is a finding  <-- pinned defect
 ...
 PASS  a post that no exported row shows is read from the state tree  <-- pinned defect
-...
-PASS  a post with no owner edit is a finding, not a clean exit 0  <-- pinned defect
+PASS  a version whose states show no own row is not verified clean, whatever the verify then sees  <-- pinned defect
+PASS  the plan says the same of such a version, not nothing found  <-- pinned defect
 ...
 PASS  a blank key is no key: a new road with a blank key does not match a deleted road with a blank key  <-- pinned defect
 ...
@@ -68,9 +68,15 @@ PASS  states that hold no visible edit are a finding, not a clean run  <-- pinne
 PASS  a version whose only visible edits the parent holds is a finding, not a clean run  <-- pinned defect
 PASS  a second version with no parent_name is refused, not dropped from the nested walk  <-- pinned defect
 PASS  a key an ascii console cannot encode prints as an escape and the run finishes with its real exit code  <-- pinned defect
+...
 PASS  without --tree the nested rows are counted, not listed  <-- pinned defect
 ...
 PASS  a nested version a reconcile skipped is a finding, not a note  <-- pinned defect
+...
+PASS  an unkeyed verify with arrived rows does not claim no reload  <-- pinned defect
+...
+PASS  a plan whose version states show no own row exits 1, not 0  <-- pinned defect
+PASS  and its verify exits 1, never 'own edits intact'  <-- pinned defect
 ...
 PASS  a unique prefix --ap is refused, not expanded  <-- pinned defect
 ...
@@ -80,15 +86,18 @@ PASS  verify exits 1 for a nested version the reconcile skipped, without any fla
 ...
 PASS  a unique prefix --unp is refused too  <-- pinned defect
 ...
+PASS  a post with no owner edit is a finding, not a clean exit 0  <-- pinned defect
+...
 PASS  an empty --before is a usage error, not a silent plan  <-- pinned defect
 ...
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
+...
 --------------------------------------------------------------------
-196 assertions, 0 failed
+202 assertions, 0 failed
 ```
 
-The full run prints all 196 assertions. Each `...` line above is where this block is cut.
+The full run prints all 202 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -121,11 +130,11 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 196 assertions, line for line, on Windows (Python 3.13.2), on
+The self-test prints the same 202 assertions, line for line, on Windows (Python 3.13.2), on
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (1001 statements, 224 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (1025 statements, 230 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -164,8 +173,9 @@ parent version were identical"
 
 Quote any text that holds a comma. A row with more or fewer cells than its header is refused
 with exit 3, and the message names the file and the line. Write a whole number in
-`parent_state_id` for every row, including state 0. An empty cell or the text NULL is refused with
-exit 3.
+`parent_state_id` for every row, including state 0. An empty cell or the text NULL in a whole-number
+column (a state id, a parent state id or the object id) is refused with exit 3. In a text column
+it is read as text.
 
 Three things about the exports are not guaranteed, and the tool enforces what it can:
 
@@ -275,6 +285,8 @@ FINDING  ROADS: 2 arriving row(s) carry the ROAD_KEY of a row the owner deleted,
 VERDICT: 1 finding(s). Explain each before you reconcile.
 ```
 
+- **No own edit seen.** The version holds states the parent does not, and no exported table shows
+  an edit in them. The verdict is a finding, not `nothing found`.
 - **A client read that disagrees.** If `T.client.csv` is present, it must match the rows derived
   from the delta tables. A client that still shows old rows is the failure in the story above.
 
@@ -309,6 +321,13 @@ A finding is raised when any of these hold:
 - **A reload.** Rows arrived that carry a key the owner deleted or changed, with the same rules
   as the plan.
 - **A client read that disagrees** with the derived view.
+- **No own edit was seen.** The version holds states of its own, and no exported table shows an
+  edit in them. The tool cannot tell an empty state from an edit in a table that was not exported,
+  so it does not say the edits are intact.
+
+Without `--key-field`, rows that arrive cannot be told from ordinary parent inserts. The verdict
+then says `no reload signal` and that a reload cannot be ruled out, and a `reload check` line
+names the count.
 
 ```
 $ python reconverify.py after_lost --edit-version OWNER.SANDBOX --before snap.json
@@ -505,8 +524,11 @@ the tool could not make sense of its input.
   parent column of the versions table is not named on any Esri page I could read, so you build
   `parent_name` from your own release. The delta table column names come from Esri's 10.0 pages.
 - A post is read from the state tree, with or without owner edits: a head state that the parent's
-  lineage did not hold at the plan and holds now is a finding. A sandbox with no edits at the plan
-  verifies as `0 of 0` rows when nothing posted, so exit 0 there rests on the state tree alone.
+  lineage did not hold at the plan and holds now is a finding. A sandbox with no states of its own
+  at the plan verifies as `0 of 0` rows when nothing posted, so exit 0 there rests on the state
+  tree alone. A sandbox that holds states of its own but shows no edit in any exported table is a
+  finding in the plan and in verify, because the tool cannot tell an empty state from an edit in a
+  table that was not exported.
 - The post test assumes a post leaves the parent holding the version's head state. Esri says only
   that "the post process pushes changes from an edit version to the target version"
   ([Versioning vocabulary](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/versioning-vocabulary.html)),
@@ -528,13 +550,18 @@ the tool could not make sense of its input.
   cannot prove that the second export came from a different process.
 - This tool prints `N -> M rows, K arrived` and flags growth only when it
   matches a key or an owner delete. A parent reload that overlaps none of the owner's rows grows
-  the version with no finding.
+  the version with no finding. Without `--key-field`, a verify that sees arrived rows prints a
+  `reload check` line, and its verdict says `no reload signal` and that a reload under new object
+  ids cannot be ruled out. It does not say `no reload`.
 - After a compress, the states the snapshot names may be gone. A snapshot whose old common
-  ancestor is not in the new lineage is refused with exit 3. Verify before the compress.
+  ancestor is not in the new lineage is refused with exit 3. Verify before the compress. The
+  refusal then blames a missing reconcile, but the cause is the compress.
 - A zero-byte CSV with no header row, such as an empty deletes table from an export that omits
   headers, is refused with exit 3 and `has no column`. Write the header even for an empty table.
 - A CSV cell larger than 128 KB, such as long geometry text, raises `csv.Error` and the run exits
-  2.
+  2. That is a tool failure, not a clean read, so a job must not treat exit 2 as no findings.
+- File names are matched in lower case. A table exported as `T.BASE.CSV` is not read, and a delta
+  file with an odd-case name is not flagged as stray.
 - Every export file is read whole into memory. Walking the lineage of a 30,000-state chain took
   about 0.005 seconds on the Windows workstation. That is not a timing of the whole export load, and a very large adds table
   is not what this is for.
@@ -577,8 +604,9 @@ the tool could not make sense of its input.
   head. The tool cannot tell a parent that moved after a good reconcile from a reconcile that ran
   too early, so it is a finding and the run exits 1. Reconcile again and export again, or plan
   again.
-- Column names are matched in upper case and by case. A PostgreSQL export with lower-case headers
-  is refused with exit 3 (`has no column`), and `--oid-field` changes only the object id column.
+- Column names are matched exactly, including case. The default object id column is `OBJECTID`.
+  A PostgreSQL export with lower-case headers is refused with exit 3 (`has no column`), and
+  `--oid-field` changes only the object id column.
 - Output is printed with the console's encoding. A key, version or table name that the encoding
   cannot print is written as a backslash escape, such as `\u2192`, so the run finishes with its
   real exit code. Set `PYTHONUTF8=1` to print the characters themselves.
@@ -591,7 +619,8 @@ the tool could not make sense of its input.
   exit 1, not a finding.
 - A snapshot whose name ends in `.csv` and that sits in the export directory would count as an
   export file in the freshness test. A `.json` snapshot there does not. The tool does not
-  restrict the snapshot's file permissions.
+  restrict the snapshot's file permissions, so it is written with the default permissions of the
+  account that ran the tool.
 
 - The demo outputs are trimmed from runs on synthetic exports that are not shipped, and one line
   (the client read) was removed from the `after_clean` demo. Only the reload demo matches a
