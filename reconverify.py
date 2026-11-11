@@ -572,6 +572,14 @@ def verify(snap, export, version, sample):
                         "state %d, the parent's state at the plan. The "
                         "reconcile did not run, or did not finish"
                         % (version, head, snap["parent_state"]))
+    elif parent_head not in v_lin:
+        # Not a finding: the parent may have moved after a good reconcile.
+        # The tool cannot tell that from a reconcile that ran too early.
+        lines.append("note: the parent is now at state %d, which the version "
+                     "does not hold. The version moved and holds the "
+                     "parent's plan state %d, so this run reads it as a "
+                     "reconcile from before the parent moved"
+                     % (parent_head, snap["parent_state"]))
     # A post makes the parent hold the version's own head state. Rows alone
     # cannot show it when the owner only deleted, so the state tree is read.
     posted_state = snap["edited"] and head in p_lin
@@ -638,6 +646,10 @@ def verify(snap, export, version, sample):
         if name not in snap["tables"]:
             lines.append("table %s is in the export but not in the snapshot, "
                          "so it was not checked" % name)
+            findings.append("%s: the table is in this export but was not in "
+                            "the plan, so the tool could not check it. Plan "
+                            "again with the table, or leave it out of the "
+                            "export" % name)
     if posted_state and not flagged:
         findings.append("%s: the parent %s now holds the version's own state "
                         "%d. Something posted" % (version, parent, head))
@@ -659,10 +671,27 @@ def read_csv(path):
     try:
         with open(path, "r", newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
-            return list(reader), list(reader.fieldnames or [])
+            rows = []
+            for row in reader:
+                # A cell past the header (an unquoted comma in a text value)
+                # lands under the key None, and a short row holds None. The
+                # row hash would drop the one and blank the other, so an
+                # edit could hide in the cells it never read.
+                if None in row or None in row.values():
+                    raise ValueError(
+                        "%s line %d has %s cells than the header. Quote text "
+                        "that holds a comma, then export again"
+                        % (os.path.basename(path), reader.line_num,
+                           "more" if None in row else "fewer"))
+                rows.append(row)
+            return rows, list(reader.fieldnames or [])
     except UnicodeDecodeError as exc:
         raise ValueError("%s is not UTF-8 text: %s"
                          % (os.path.basename(path), exc))
+    except csv.Error as exc:
+        raise csv.Error("%s: %s. Look for a very long cell, such as geometry "
+                        "text, or a stray control character, and export "
+                        "again" % (os.path.basename(path), exc))
 
 
 def need(header, names, path):
@@ -739,6 +768,14 @@ def load_export(folder, oid_field, key_field):
         raise ValueError("versions.csv lists a version name more than once. "
                          "Names are matched as written, so give each its "
                          "OWNER.NAME")
+    # A parent name that matches no version would drop that version, and
+    # everything nested under it, out of the nested-version walk unflagged.
+    orphans = sorted(n for n, (_, p) in versions.items()
+                     if p and p not in versions)
+    if orphans:
+        raise ValueError("versions.csv names a parent that is not a version "
+                         "name, for %s. Names are matched as written, so fix "
+                         "the parent_name column" % ", ".join(orphans))
     tables = dict((n[:-len(".base.csv")],
                    load_table(folder, n[:-len(".base.csv")], oid_field,
                               key_field))
@@ -784,6 +821,10 @@ def self_test():
         with open(os.path.join(folder, name), "w", newline="",
                   encoding="utf-8") as handle:
             handle.write(text)
+
+    def slurp(folder, name):
+        with open(os.path.join(folder, name), encoding="utf-8") as handle:
+            return handle.read()
 
     # One synthetic table of ten road segments. A row is (oid, key, name,
     # surface); an adds row puts its state second.
@@ -1034,6 +1075,21 @@ def self_test():
           "a parent that moved after the plan, with the version unmoved, is "
           "a finding  <-- pinned defect")
 
+    # The sandbox moved to state 20 holding the parent's plan state 2, and
+    # the parent then moved on to state 3.
+    moved_tree = after_tree + [(3, 2)]
+    moved_dir = export("moved_after", moved_tree, [
+        ("SDE.DEFAULT", 0, ""), ("OWNER.EDITS", 3, "SDE.DEFAULT"),
+        ("OWNER.SANDBOX", 20, "OWNER.EDITS")],
+        shared_adds + own_adds + quiet_adds + redo_adds,
+        shared_dels + own_dels + quiet_dels + redo_quiet, good_view)
+    lines, findings = verify(snap_quiet, load_export(
+        moved_dir, DEFAULT_OID_FIELD, None), "OWNER.SANDBOX", 10)
+    check(findings == [] and any(l.startswith("note: the parent is now at "
+                                              "state 3") for l in lines),
+          "a moved version that lacks the parent's new head is noted, not "
+          "called verified in silence  <-- pinned defect")
+
     # ---- first review. A version that moved without a reconcile, a post
     # of deletes only, a post no row shows, blank keys, an update reloaded
     # under a new object id, and conflicts the plan can see.
@@ -1182,10 +1238,12 @@ def self_test():
     put(side, "SIGNS.deletes.csv",
         "SDE_DELETES_ROW_ID,SDE_STATE_ID,DELETED_AT\n")
     lines, findings = verify_of(snap_quiet, side)
-    check(findings == [] and "table SIGNS is in the export but not in the "
-          "snapshot, so it was not checked" in lines,
-          "a table the snapshot never saw is named, not skipped in silence  "
-          "<-- pinned defect")
+    check("table SIGNS is in the export but not in the snapshot, so it was "
+          "not checked" in lines and len(findings) == 1
+          and findings[0].startswith("SIGNS: the table is in this export but "
+                                     "was not in the plan"),
+          "a table the snapshot never saw is a finding, not a verdict of "
+          "verified  <-- pinned defect")
 
     raises(lambda: verify(snap_quiet, ex_quiet, "OWNER.SANDBOX", 10),
            "verifying against the snapshot's own export is refused  "
@@ -1517,6 +1575,40 @@ def self_test():
     check(code == 2, "a --before file that does not exist exits 2")
     code, out, err = run_cli([os.path.join(tmp, "nowhere")] + sv)
     check(code == 2, "an export directory that does not exist exits 2")
+    code, out, err = run_cli([side] + sv + ["--before", snap_path])
+    check(code == 1 and "VERDICT: 1 finding(s). The reconcile is not "
+          "verified." in out,
+          "an exported table the snapshot never saw exits 1, not the 0 of a "
+          "clean read  <-- pinned defect")
+    orphan = os.path.join(tmp, "orphan")
+    shutil.copytree(nv_after_dir, orphan)
+    put(orphan, "versions.csv", slurp(orphan, "versions.csv").replace(
+        "OWNER.CHILD,13,OWNER.SANDBOX", "OWNER.CHILD,13,owner.sandbox"))
+    code, out, err = run_cli([orphan] + sv + ["--before", snap_path])
+    check(code == 3 and "names a parent that is not a version name, for "
+          "OWNER.CHILD" in err,
+          "a parent name that matches no version is refused, not left out of "
+          "the nested walk  <-- pinned defect")
+    ragged = os.path.join(tmp, "ragged")
+    for label, row, word in (("long", "5,R-05,Smith, John,DIRT", "more"),
+                             ("short", "5,R-05,Smith", "fewer")):
+        shutil.copytree(quiet_dir, ragged + label)
+        put(ragged + label, "ROADS.base.csv", slurp(
+            ragged + label, "ROADS.base.csv").replace(
+                "5,R-05,Road 5,DIRT", row))
+        code, out, err = run_cli([ragged + label] + sv)
+        check(code == 3 and "ROADS.base.csv line 6 has %s cells than the "
+              "header" % word in err,
+              "a %s CSV row is refused with its file and line, not read with "
+              "cells dropped  <-- pinned defect" % label)
+    huge = os.path.join(tmp, "huge")
+    shutil.copytree(quiet_dir, huge)
+    put(huge, "ROADS.base.csv", "OBJECTID,ROAD_KEY,NAME,SURFACE\n"
+        "1,R-01,\"%s\",DIRT\n" % ("x" * 140000))
+    code, out, err = run_cli([huge] + sv)
+    check(code == 2 and "ROADS.base.csv: field larger than field limit" in err
+          and "export again" in err,
+          "a cell over the CSV field limit exits 2 and names its file")
     code, out, err = run_cli([quiet_dir] + sv + ["--snapshot", os.path.join(
         tmp, "no", "dir", "s.json"), "--apply"])
     check(code == 2 and "could not write" in err,

@@ -76,10 +76,10 @@ PASS  a unique prefix --unp is refused too  <-- pinned defect
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-177 assertions, 0 failed
+183 assertions, 0 failed
 ```
 
-The full run prints all 177 assertions. Each `...` line above is where this block is cut.
+The full run prints all 183 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -112,11 +112,11 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 177 assertions, line for line, on Windows (Python 3.13.2), on
-Windows under Python 3.12.10, on Ubuntu (Python 3.12.3) and on Ubuntu under Python 3.9.25.
-The Windows 3.9 run was not reproduced here: no Windows 3.9 interpreter was available.
+The self-test prints the same 183 assertions, line for line, on Windows (Python 3.13.2), on
+Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
+Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (918 statements, 196 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (956 statements, 206 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -150,6 +150,11 @@ defines the common ancestor as "a representation of the data when the edit versi
 parent version were identical"
 ([Versioning vocabulary](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/versioning-vocabulary.html)).
 
+Quote any text that holds a comma. A row with more or fewer cells than its header is refused
+with exit 3, and the message names the file and the line. Write a whole number in
+`parent_state_id` for every row, including state 0. An empty cell or the text NULL is refused with
+exit 3.
+
 Three things about the exports are not guaranteed, and the tool enforces what it can:
 
 - **The version table needs a parent name in the same form as the name.** Esri's system table
@@ -161,10 +166,11 @@ Three things about the exports are not guaranteed, and the tool enforces what it
   pages, so this repository gives no SQL for it. Look at the columns of your own versions table
   (`SELECT TOP 1 * FROM sde.SDE_versions` on SQL Server), and build `OWNER.NAME` for the name and
   for the parent name yourself. Esri says the system tables may be viewed with SQL and must not
-  be altered with anything but ArcGIS software
+  be altered with anything but ArcGIS software or the SDK
   ([System tables in PostgreSQL](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-postgresql/geodatabase-system-tables-postgresql.html)).
   The default version has no parent and should export an empty `parent_name`. A version name
-  must appear once, and the tool refuses a duplicate. Names are matched as written, so
+  must appear once, and the tool refuses a duplicate. A `parent_name` that matches no version
+  name is refused with exit 3. Names are matched as written, so
   `owner.sandbox` does not find `OWNER.SANDBOX`.
 - **The adds table has its own object id column.** Rename it in the export to the object id
   column of the base table, or pass `--oid-field` for the name the base table uses.
@@ -444,8 +450,8 @@ wrote snap.json
 ```
 
 The snapshot is opened with mode `x`, so an existing file is refused with exit 2 and is never
-overwritten. The snapshot stores the exact `--key-field` values of every row the owner deleted or
-changed. Point `--key-field` at a business key, not at a column that holds personal data, and
+overwritten. The snapshot stores the `--key-field` values of every row the owner deleted or changed,
+with surrounding whitespace removed, repeats collapsed and blank keys left out. Point `--key-field` at a business key, not at a column that holds personal data, and
 treat the snapshot as sensitive as that column.
 
 ## Exit codes
@@ -453,9 +459,9 @@ treat the snapshot as sensitive as that column.
 | Code | Meaning |
 |---|---|
 | 0 | Nothing found. |
-| 1 | At least one finding. A nested version that is behind is one, in every mode. With `--unposted`, so is an unposted edit, a row that matches its ancestor, or an export the tool could not read an edit from. |
+| 1 | At least one finding. A nested version that is behind is one in a verify run and under `--unposted`. A plan names nested versions and does not judge them. With `--unposted`, so is an unposted edit, a row that matches its ancestor, or an export the tool could not read an edit from. |
 | 2 | A file could not be read or written, including a snapshot that already exists. |
-| 3 | Refused. The export is not a usable state tree, the after export is the snapshot's own read, a file is not UTF-8, or the snapshot is unusable. |
+| 3 | Refused. The export is not a usable state tree, a `parent_name` matches no version, a CSV row has more or fewer cells than its header, the after export is the snapshot's own read, a file is not UTF-8, or the snapshot is unusable. |
 | 64 | Usage error, including an unknown or abbreviated flag. |
 
 Exit 3 is deliberately not exit 1. A job that files a finding on exit 1 must not file one when
@@ -477,7 +483,7 @@ the tool could not make sense of its input.
   the plan named.
 - Only tables that have a `T.base.csv` are checked. An edit in a table that was not exported is
   invisible, apart from the post test above. A table that is in the second export and not in the
-  snapshot is named in the output and not checked.
+  snapshot is named in the output, is not checked, and is a finding, so the run exits 1.
 - The row comparison is by text. The client read and the delta tables must come from one
   formatter. A client file that writes NULL as `None` where the delta export writes an empty
   cell, or `1.0` where the other writes `1`, is reported as differing on every such row. A
@@ -519,8 +525,7 @@ the tool could not make sense of its input.
   tool cannot tell an edit in a table it was not given from a state that holds no edit. A sandbox
   that was reconciled with nothing to carry can therefore exit 1 under `--unposted`.
 - A nested version is behind when its lineage lacks its parent's head state. The tool cannot know
-  whether the run was meant to reach it, so a child that you left alone on purpose is reported. That a reconcile leaves the parent's head in the version's own lineage
-  is the tool's model of the state tree, shown on synthetic exports and not on a live server.
+  whether the run was meant to reach it, so a child that you left alone on purpose is reported.
 - Esri's pages do not say whether `ALL_VERSIONS` reaches versions nested under a version that is
   not the target. This repository did not run the Esri tool, so it makes no claim about what that
   tool did on any run. It checks the outcome that the exports show.
@@ -537,7 +542,9 @@ the tool could not make sense of its input.
 - `--edit-version` must name a version that has a parent. The default version is refused with
   exit 3, so `--unposted` cannot sweep every version from the root.
 - A version that moved and whose parent then moved after the reconcile is checked only against the
-  parent's state at the plan.
+  parent's state at the plan. When the version lacks the parent's new head, the output carries a
+  `note:` line and the run still exits 0, because the tool cannot tell a parent that moved after a
+  good reconcile from a reconcile that ran too early. The same version left unmoved is a finding.
 - Column names are matched in upper case and by case. A PostgreSQL export with lower-case headers
   is refused with exit 3 (`has no column`), and `--oid-field` changes only the object id column.
 - Output is printed with the console's encoding. A key, version or table name that the encoding
@@ -548,10 +555,24 @@ the tool could not make sense of its input.
   exit 3.
 - Values from the export are printed as they are, so a control or escape character in a key or
   name reaches the terminal.
-- Do not write the snapshot into the export directory, because the snapshot would then count as
-  an export file in the freshness test. The tool does not restrict the snapshot's file
-  permissions.
-- The Windows 3.9 run of the self-test is not reproduced here. The 3.9.25 run was on Ubuntu.
+- A snapshot whose name ends in `.csv` and that sits in the export directory would count as an
+  export file in the freshness test. A `.json` snapshot there does not. The tool does not
+  restrict the snapshot's file permissions.
+
+- The README demo outputs come from synthetic exports built inside the self-test, which are not
+  shipped, so a reader cannot rerun them from the repository alone.
+- The post-reconcile state-tree shape (a new state whose parent is the target's head) is this
+  tool's model, matched to no Esri page, and was never checked against a live geodatabase.
+- The stale-layer cause in the opening story is the author's reading of the incident and was not
+  reproduced here.
+- Without `--tree`, `--unposted` judges only the named version, so a clean exit does not cover
+  the unposted edits of nested versions that are not behind.
+- A row's NULL and its empty text hash the same, so an edit between the two is invisible.
+- A newline inside a key can make one row print as several lines, including lines that read like
+  `FINDING` or `VERDICT`. Read the exit code, not the text.
+- The message of commit 36a6501 says "Flag nested child versions that a reconcile skipped, still
+  exit 0". It does not mean the tool exits 0 on a skipped child. A skipped child is a finding and
+  the run exits 1.
 
 ## Contributing
 
