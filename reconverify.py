@@ -364,7 +364,7 @@ def row_line(row, key_field):
     return text
 
 
-def unposted_report(export, version, key_field, cap):
+def unposted_report(export, version, key_field, cap, listed=True):
     """(lines, findings): edits a version saved that its parent does not hold.
 
     The state tree gives the headline. Rows give the list. A version whose
@@ -407,8 +407,9 @@ def unposted_report(export, version, key_field, cap):
                          % (len(rows) - len(shown)))
         if rows:
             findings.append("%s: %d edit(s) saved in %s were never posted to "
-                            "%s. The rows are listed above"
-                            % (name, len(rows), version, parent))
+                            "%s. %s" % (name, len(rows), version, parent,
+                                        "The rows are listed above" if listed
+                                        else "Add --tree to list the rows"))
         if reverted:
             # A shape-only edit leaves every exported column as it was, so
             # it looks the same as an edit put back.
@@ -418,12 +419,18 @@ def unposted_report(export, version, key_field, cap):
                             "that was not exported, such as the shape. The "
                             "tool cannot tell which" % (name, reverted,
                                                         version))
-    if not seen:
+    if not findings and not seen:
         findings.append("%s: holds %d state(s) the parent does not, and no "
                         "exported table shows an edit in them. The edits sit "
                         "in a table that was not exported, or the states hold "
                         "none. The tool cannot tell which"
                         % (version, len(own)))
+    elif not findings:
+        findings.append("%s: holds %d state(s) the parent does not. The only "
+                        "edits the exported tables show in them are ones the "
+                        "parent already holds. An edit in a table that was "
+                        "not exported would not show. The tool cannot tell "
+                        "whether any remains" % (version, len(own)))
     return lines, findings
 
 
@@ -431,10 +438,11 @@ def unposted_tree(export, version, key_field, cap, tree):
     """(lines, findings) for a version, and with `tree` every nested one."""
     lines, findings = unposted_report(export, version, key_field, cap)
     pairs = subtree(export["versions"], version)
-    for child, parent in pairs if tree else ():
-        more, found = unposted_report(export, child, key_field, cap)
-        lines.append("nested version %s" % child)
-        lines.extend(more)
+    for child, parent in pairs:
+        more, found = unposted_report(export, child, key_field, cap, tree)
+        if tree:
+            lines.append("nested version %s" % child)
+            lines.extend(more)
         findings.extend(found)
     # A child no reconcile has reached is a finding with or without --tree.
     findings.extend(nested_finding(*b) for b in behind(export, pairs))
@@ -573,13 +581,16 @@ def verify(snap, export, version, sample):
                         "reconcile did not run, or did not finish"
                         % (version, head, snap["parent_state"]))
     elif parent_head not in v_lin:
-        # Not a finding: the parent may have moved after a good reconcile.
-        # The tool cannot tell that from a reconcile that ran too early.
-        lines.append("note: the parent is now at state %d, which the version "
-                     "does not hold. The version moved and holds the "
-                     "parent's plan state %d, so this run reads it as a "
-                     "reconcile from before the parent moved"
-                     % (parent_head, snap["parent_state"]))
+        # The parent may have moved after a good reconcile. The tool cannot
+        # tell that from a reconcile that ran too early, so it does not
+        # call the version verified.
+        findings.append("%s: the version moved to state %d and holds the "
+                        "parent's plan state %d, but not state %d, where the "
+                        "parent now points. The tool cannot tell a reconcile "
+                        "that ran before the parent moved from one that "
+                        "left out the parent's newer edits. Reconcile again "
+                        "and export again, or plan again"
+                        % (version, head, snap["parent_state"], parent_head))
     # A post makes the parent hold the version's own head state. Rows alone
     # cannot show it when the owner only deleted, so the state tree is read.
     posted_state = snap["edited"] and head in p_lin
@@ -768,6 +779,14 @@ def load_export(folder, oid_field, key_field):
         raise ValueError("versions.csv lists a version name more than once. "
                          "Names are matched as written, so give each its "
                          "OWNER.NAME")
+    # A second blank parent_name would make a second root, which the
+    # nested-version walk from the default version never reaches.
+    roots = sorted(n for n, (_, p) in versions.items() if not p)
+    if len(roots) > 1:
+        raise ValueError("versions.csv gives %d versions no parent_name, "
+                         "for %s. Only the default version has none, so "
+                         "fix the parent_name column" % (len(roots),
+                                                         ", ".join(roots)))
     # A parent name that matches no version would drop that version, and
     # everything nested under it, out of the nested-version walk unflagged.
     orphans = sorted(n for n, (_, p) in versions.items()
@@ -1085,10 +1104,11 @@ def self_test():
         shared_dels + own_dels + quiet_dels + redo_quiet, good_view)
     lines, findings = verify(snap_quiet, load_export(
         moved_dir, DEFAULT_OID_FIELD, None), "OWNER.SANDBOX", 10)
-    check(findings == [] and any(l.startswith("note: the parent is now at "
-                                              "state 3") for l in lines),
-          "a moved version that lacks the parent's new head is noted, not "
-          "called verified in silence  <-- pinned defect")
+    check(len(findings) == 1 and findings[0].startswith(
+        "OWNER.SANDBOX: the version moved to state 20 and holds the parent's "
+        "plan state 2, but not state 3") and "cannot tell" in findings[0],
+          "a moved version that lacks the parent's new head is a finding, "
+          "not verified  <-- pinned defect")
 
     # ---- first review. A version that moved without a reconcile, a post
     # of deletes only, a post no row shows, blank keys, an update reloaded
@@ -1436,16 +1456,58 @@ def self_test():
           "states that hold no visible edit are a finding, not a clean "
           "run  <-- pinned defect")
 
+    # The only edit the exported tables show is one the parent made too.
+    held_dir = export(
+        "held_only", [(0, 0), (1, 0), (2, 1), (10, 1)],
+        [("SDE.DEFAULT", 0, ""), ("OWNER.EDITS", 2, "SDE.DEFAULT"),
+         ("OWNER.SANDBOX", 10, "OWNER.EDITS")],
+        [(4, 2, "R-04", "Road 4 P", "PAVED"),
+         (4, 10, "R-04", "Road 4 P", "PAVED")], [(4, 0, 2), (4, 0, 10)])
+    lines, findings = unposted_report(
+        load_export(held_dir, DEFAULT_OID_FIELD, None), "OWNER.SANDBOX",
+        None, 100)
+    check(len(findings) == 1 and "already in the parent 1, same as the "
+          "ancestor 0" in "\n".join(lines) and "ones the parent already "
+          "holds" in findings[0] and "cannot tell whether any remains"
+          in findings[0],
+          "a version whose only visible edits the parent holds is a finding, "
+          "not a clean run  <-- pinned defect")
+
+    # A second version with no parent_name is a second root.
+    raises(lambda: load_export(export(
+        "two_roots", tree, versions + [("OWNER.CHILD", 12, "")], [], []),
+        DEFAULT_OID_FIELD, None),
+           "a second version with no parent_name is refused, not dropped "
+           "from the nested walk  <-- pinned defect",
+           "Only the default version has none")
+
+    # A key the console codec cannot encode must not end the run with the
+    # exit code of a finding.
+    uni_dir = export("uni_key", tree, versions,
+                     [(200, 12, "K\u2192\u4e2d", "Road 200", "PAVED")], [])
+    ascii_out = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+    with contextlib.redirect_stdout(ascii_out):
+        code = main([uni_dir, "--edit-version", "OWNER.SANDBOX",
+                     "--unposted", "--key-field", "ROAD_KEY"])
+    ascii_out.flush()
+    text = ascii_out.buffer.getvalue().decode("ascii")
+    check(code == 1 and "ROAD_KEY K\\u2192\\u4e2d" in text
+          and "VERDICT: " in text,
+          "a key an ascii console cannot encode prints as an escape and the "
+          "run finishes with its real exit code  <-- pinned defect")
+
     # Posted: the parent holds the sandbox's state, so nothing is left.
-    ex_posted = load_export(posted_dir, DEFAULT_OID_FIELD, None)
+    ex_posted =load_export(posted_dir, DEFAULT_OID_FIELD, None)
     lines, findings = unposted_report(ex_posted, "OWNER.SANDBOX", None, 100)
     check(findings == [] and "nothing to post: the parent holds every state "
           "of the version" in "\n".join(lines),
           "a version the parent already holds has nothing to post")
 
     lines, findings = unposted_tree(ex_nv, "OWNER.SANDBOX", None, 100, False)
-    check("nested version" not in "\n".join(lines) and len(findings) == 1,
-          "without --tree only the named version is listed")
+    check("nested version" not in "\n".join(lines) and len(findings) == 3
+          and sum("Add --tree to list the rows" in f for f in findings) == 2,
+          "without --tree the nested rows are counted, not listed  "
+          "<-- pinned defect")
     lines, findings = unposted_tree(ex_nv, "OWNER.SANDBOX", None, 100, True)
     text = "\n".join(lines)
     check(len(findings) == 3 and "nested version OWNER.CHILD" in text
@@ -1490,7 +1552,7 @@ def self_test():
           "a nested version a reconcile skipped is a finding, not a note  "
           "<-- pinned defect")
     lines, findings = unposted_tree(ex_nva, "OWNER.SANDBOX", None, 100, False)
-    check(len(findings) == 2 and findings[-1].startswith("OWNER.CHILD: "
+    check(len(findings) == 4 and findings[-1].startswith("OWNER.CHILD: "
                                                          "behind")
           and "nested version" not in "\n".join(lines),
           "--unposted without --tree flags the skipped child too  "
@@ -1678,7 +1740,7 @@ def self_test():
           "--unposted on a version the parent holds exits 0")
     code, out, err = run_cli([nv_dir] + sv + ["--unposted"])
     check(code == 1 and "nested version OWNER" not in out
-          and "VERDICT: 1 finding(s). Saved edits did not post, or the tool "
+          and "VERDICT: 3 finding(s). Saved edits did not post, or the tool "
           "could not tell. 2 nested version(s) under OWNER.SANDBOX, 0 behind "
           "their parent, have no rows listed. Add --tree." in out,
           "--unposted without --tree says it did not list the nested "
@@ -1690,7 +1752,7 @@ def self_test():
           "--unposted --tree covers the whole tree")
     code, out, err = run_cli([nv_after_dir] + sv + ["--unposted"])
     check(code == 1 and "FINDING  OWNER.CHILD: behind its parent" in out
-          and "VERDICT: 2 finding(s)." in out,
+          and "VERDICT: 4 finding(s)." in out,
           "--unposted without --tree exits 1 for a skipped child  "
           "<-- pinned defect")
     code, out, err = run_cli([nv_dir, "--edit-version", "OWNER.GRAND",
@@ -1848,7 +1910,20 @@ def usage(message):
     return 64
 
 
+def escape_unprintable(stream):
+    """Make `stream` print a character its codec cannot encode as an escape.
+
+    Without this, a key that holds such a character raises UnicodeEncodeError
+    half way through the report and the run exits 1, the code of a finding.
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure:
+        reconfigure(errors="backslashreplace")
+
+
 def main(argv=None):
+    escape_unprintable(sys.stdout)
+    escape_unprintable(sys.stderr)
     try:
         args = _parse(sys.argv[1:] if argv is None else argv)
     except SystemExit as exc:

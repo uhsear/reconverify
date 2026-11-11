@@ -43,6 +43,7 @@ PASS  a reconcile that posted is a finding  <-- pinned defect
 PASS  a version that never moved, with a parent to pull, is a finding
 PASS  but not when the parent is still at the common ancestor: nothing to pull in
 PASS  a parent that moved after the plan, with the version unmoved, is a finding  <-- pinned defect
+PASS  a moved version that lacks the parent's new head is a finding, not verified  <-- pinned defect
 PASS  a version that moved on one more edit, without the parent pulled in, is a finding  <-- pinned defect
 PASS  a post of delete-only edits is a finding  <-- pinned defect
 ...
@@ -62,6 +63,10 @@ PASS  and lists each row with its key and the state that wrote it  <-- pinned de
 PASS  saved edits that never posted are a finding, not a clean run  <-- pinned defect
 ...
 PASS  states that hold no visible edit are a finding, not a clean run  <-- pinned defect
+PASS  a version whose only visible edits the parent holds is a finding, not a clean run  <-- pinned defect
+PASS  a second version with no parent_name is refused, not dropped from the nested walk  <-- pinned defect
+PASS  a key an ascii console cannot encode prints as an escape and the run finishes with its real exit code  <-- pinned defect
+PASS  without --tree the nested rows are counted, not listed  <-- pinned defect
 ...
 PASS  a nested version a reconcile skipped is a finding, not a note  <-- pinned defect
 ...
@@ -76,10 +81,10 @@ PASS  a unique prefix --unp is refused too  <-- pinned defect
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-183 assertions, 0 failed
+186 assertions, 0 failed
 ```
 
-The full run prints all 183 assertions. Each `...` line above is where this block is cut.
+The full run prints all 186 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -98,8 +103,8 @@ reach for. Esri says it lists the changes "made to the version from the time it 
 target version were identical", as Insert, Delete and Update, and that it "lists the modified
 layers and the features that were edited in those layers"
 ([View traditional version changes](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/using-the-version-changes-command.html)).
-It does that inside Pro, for a version you are connected to, and each feature shows its Current, Target and
-Common Ancestor values. The page does not say whether the differences can be exported or scripted.
+It does that inside Pro, for a version you are connected to, and a selected feature shows its Current, Target
+and Common Ancestor values. The page does not say whether the differences can be exported or scripted.
 This tool adds a different thing: a list you can diff and keep from an export, an exit code, a
 count of the edits the parent already holds, and a check of every nested version in the same run.
 
@@ -112,11 +117,11 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 183 assertions, line for line, on Windows (Python 3.13.2), on
+The self-test prints the same 186 assertions, line for line, on Windows (Python 3.13.2), on
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (956 statements, 206 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (979 statements, 214 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -204,7 +209,7 @@ python reconverify.py now/ --edit-version OWNER.SANDBOX --unposted --tree
 | `--key-field` | off | A business key that survives a reload. It makes the reload count exact. |
 | `--sample` | `10` | With a plan or `--before`, how many object ids are listed after a finding. `0` lists none. |
 | `--unposted` | off | List the edits the version holds that its parent does not, row by row. Reads one export. Writes nothing. |
-| `--tree` | off | With `--unposted`, also list the unposted rows of every version nested under `--edit-version`. |
+| `--tree` | off | With `--unposted`, also list the unposted rows of every version nested under `--edit-version`. Without it the nested versions are still read, and an unposted edit in one is still a finding. |
 | `--rows` | `100` | With `--unposted`, rows listed per table. `0` lists every row. |
 | `--apply` | off | Write the `--snapshot` file. Nothing else writes. |
 | `--self-test` | off | Run the assertions and exit. |
@@ -358,10 +363,14 @@ table ROADS
     deleted  2  ROAD_KEY R-02
     deleted  3  ROAD_KEY R-03
 FINDING  ROADS: 4 edit(s) saved in OWNER.SANDBOX were never posted to OWNER.EDITS. The rows are listed above
-VERDICT: 1 finding(s). Saved edits did not post, or the tool could not tell. 2 nested version(s) under OWNER.SANDBOX, 0 behind their parent, have no rows listed. Add --tree.
+FINDING  ROADS: 1 edit(s) saved in OWNER.CHILD were never posted to OWNER.SANDBOX. Add --tree to list the rows
+FINDING  ROADS: 1 edit(s) saved in OWNER.GRAND were never posted to OWNER.CHILD. Add --tree to list the rows
+VERDICT: 3 finding(s). Saved edits did not post, or the tool could not tell. 2 nested version(s) under OWNER.SANDBOX, 0 behind their parent, have no rows listed. Add --tree.
 ```
 
-The verdict carries a sentence for the nested versions whose rows the run did not list. The sandbox above
+Without `--tree` the run still reads every nested version, so a nested version that holds an
+unposted edit is a finding and the exit code is 1. `--tree` only adds the row lists. The verdict
+carries a sentence for the nested versions whose rows the run did not list. The sandbox above
 has two, so the sentence names them. After a no-post reconcile the sandbox's edits are still
 unposted, so this list is the one to read when you ask "did anything post?". A version that the
 parent holds in full has nothing to post:
@@ -389,6 +398,21 @@ FINDING  OWNER.SANDBOX: holds 3 state(s) the parent does not, and no exported ta
 VERDICT: 1 finding(s). Saved edits did not post, or the tool could not tell.
 ```
 
+The same holds when the only edits that the exported tables show are ones the parent already
+holds. A table that was not exported could hold more, so the run does not say clean:
+
+```
+$ python reconverify.py held_only --edit-version OWNER.SANDBOX --unposted
+reconverify unposted: held_only
+version OWNER.SANDBOX at state 10, parent OWNER.EDITS at state 2, common ancestor 1
+  states the parent does not hold  1
+table ROADS
+  unposted              0 row(s): 0 inserted, 0 updated, 0 deleted
+  already in the parent 1, same as the ancestor 0
+FINDING  OWNER.SANDBOX: holds 1 state(s) the parent does not. The only edits the exported tables show in them are ones the parent already holds. An edit in a table that was not exported would not show. The tool cannot tell whether any remains
+VERDICT: 1 finding(s). Saved edits did not post, or the tool could not tell.
+```
+
 The list is capped at `--rows` rows per table, and the output says how many rows it left out.
 `--rows 0` lists every row.
 
@@ -413,7 +437,8 @@ modified since you last reconciled changes"
 By that rule, a child that is behind cannot post to its parent until it reconciles again.
 
 Each nested version that is behind is a finding, with or without a flag, in `verify` and in
-`--unposted`, so a job that reads only the exit code sees a skipped child. `--tree` is an
+`--unposted`, so a job that reads only the exit code sees a skipped child. A nested version
+with an unposted edit is a finding under `--unposted` with or without `--tree`. `--tree` is an
 `--unposted` option that also lists the unposted rows of every nested version against its own
 parent. The plan names the nested versions and does not judge them. They are judged after the
 reconcile.
@@ -459,9 +484,9 @@ treat the snapshot as sensitive as that column.
 | Code | Meaning |
 |---|---|
 | 0 | Nothing found. |
-| 1 | At least one finding. A nested version that is behind is one in a verify run and under `--unposted`. A plan names nested versions and does not judge them. With `--unposted`, so is an unposted edit, a row that matches its ancestor, or an export the tool could not read an edit from. |
+| 1 | At least one finding. A nested version that is behind is one in a verify run and under `--unposted`. So is a version that moved but lacks the parent's new head. A plan names nested versions and does not judge them. With `--unposted`, so is an unposted edit in the named version or in a nested one, a row that matches its ancestor, or an export the tool could not read an edit from, including one where the only visible edits are ones the parent already holds. |
 | 2 | A file could not be read or written, including a snapshot that already exists. |
-| 3 | Refused. The export is not a usable state tree, a `parent_name` matches no version, a CSV row has more or fewer cells than its header, the after export is the snapshot's own read, a file is not UTF-8, or the snapshot is unusable. |
+| 3 | Refused. The export is not a usable state tree, a `parent_name` matches no version, more than one version has no `parent_name`, a CSV row has more or fewer cells than its header, the after export is the snapshot's own read, a file is not UTF-8, or the snapshot is unusable. |
 | 64 | Usage error, including an unknown or abbreviated flag. |
 
 Exit 3 is deliberately not exit 1. A job that files a finding on exit 1 must not file one when
@@ -493,7 +518,7 @@ the tool could not make sense of its input.
 - The freshness test compares file bytes. An export that differs by one byte from the snapshot's
   export passes it. A byte-different re-export of an unchanged state counts as fresh. The tool
   cannot prove that the second export came from a different process.
-- The original reconcile script also raised a problem when a table's row count jumped by more
+- A reconcile script can also raise a problem when a table's row count jumps by more
   than 10 percent. This tool prints `N -> M rows, K arrived` and flags growth only when it
   matches a key or an owner delete. A parent reload that overlaps none of the owner's rows grows
   the version with no finding.
@@ -537,40 +562,54 @@ the tool could not make sense of its input.
   is a finding that the tool cannot explain further.
 - After a no-post reconcile the sandbox's own edits are unposted by design, so a correct
   reconcile still exits 1 under `--unposted`.
-- `--unposted` cannot judge a table that it was not given once any exported table shows an edit
-  the parent already holds.
+- `--unposted` cannot see an edit in a table that it was not given. It reports the edits it sees,
+  and it says so when the only ones it sees are ones the parent already holds.
 - `--edit-version` must name a version that has a parent. The default version is refused with
   exit 3, so `--unposted` cannot sweep every version from the root.
-- A version that moved and whose parent then moved after the reconcile is checked only against the
-  parent's state at the plan. When the version lacks the parent's new head, the output carries a
-  `note:` line and the run still exits 0, because the tool cannot tell a parent that moved after a
-  good reconcile from a reconcile that ran too early. The same version left unmoved is a finding.
+- A version that moved and whose parent then moved after the reconcile lacks the parent's new
+  head. The tool cannot tell a parent that moved after a good reconcile from a reconcile that ran
+  too early, so it is a finding and the run exits 1. Reconcile again and export again, or plan
+  again.
 - Column names are matched in upper case and by case. A PostgreSQL export with lower-case headers
   is refused with exit 3 (`has no column`), and `--oid-field` changes only the object id column.
 - Output is printed with the console's encoding. A key, version or table name that the encoding
-  cannot print raises `UnicodeEncodeError`, and the run exits 1, which a job reads as a finding.
-  Set `PYTHONUTF8=1`.
+  cannot print is written as a backslash escape, such as `\u2192`, so the run finishes with its
+  real exit code. Set `PYTHONUTF8=1` to print the characters themselves.
 - Any uncaught exception exits 1, the same code as a finding. A snapshot edited by hand into the
   wrong value types, with its keys and format tag intact, can crash the run that way instead of
   exit 3.
 - Values from the export are printed as they are, so a control or escape character in a key or
   name reaches the terminal.
+- The snapshot check tests keys, not value types. A snapshot edited by hand to hold the wrong type
+  of value can end the run with a traceback and exit 1. Do not edit snapshots.
+- Closing the output pipe early, for example with `| head`, ends the run with a traceback and
+  exit 1, not a finding.
 - A snapshot whose name ends in `.csv` and that sits in the export directory would count as an
   export file in the freshness test. A `.json` snapshot there does not. The tool does not
   restrict the snapshot's file permissions.
 
-- The README demo outputs come from synthetic exports built inside the self-test, which are not
-  shipped, so a reader cannot rerun them from the repository alone.
+- The README demo outputs come from the same synthetic exports that the self-test builds, but the
+  self-test prints no plan or verify text and the demo names (`before_conflict`, `after_idle` and
+  the like) are not the self-test's labels. The exports are not shipped, so a reader cannot rerun
+  the demos from the repository alone.
 - The post-reconcile state-tree shape (a new state whose parent is the target's head) is this
   tool's model, matched to no Esri page, and was never checked against a live geodatabase.
 - The stale-layer cause in the opening story is the author's reading of the incident and was not
   reproduced here.
-- Without `--tree`, `--unposted` judges only the named version, so a clean exit does not cover
-  the unposted edits of nested versions that are not behind.
+- A clean `--unposted` exit covers the named version and every nested version in the export. Without
+  `--tree` the nested versions are read, but their rows are not listed.
+- The plan prints "Check them after the reconcile with --tree", but `--tree` is accepted only with
+  `--unposted`, and verify rejects it with exit 64. After a reconcile, verify counts nested versions
+  without a flag.
+- A reconcile that changed nothing in the exported files cannot be verified, because the
+  freshness test refuses an identical export with exit 3.
+- Freshness depends on how you export. The tool reads exports and starts no child process.
+- A duplicate row in `T.client.csv` collapses to one entry, so the client-read check cannot
+  report the duplicate.
 - A row's NULL and its empty text hash the same, so an edit between the two is invisible.
 - A newline inside a key can make one row print as several lines, including lines that read like
   `FINDING` or `VERDICT`. Read the exit code, not the text.
-- The message of commit 36a6501 says "Flag nested child versions that a reconcile skipped, still
+- An earlier commit message says "Flag nested child versions that a reconcile skipped, still
   exit 0". It does not mean the tool exits 0 on a skipped child. A skipped child is a finding and
   the run exits 1.
 
