@@ -101,7 +101,7 @@ PASS  importing the module prints nothing and exposes the core
 211 assertions, 0 failed
 ```
 
-The full run prints all 209 assertions. Each `...` line above is where this block is cut.
+The full run prints all 211 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -120,8 +120,8 @@ reach for. Esri says it lists the changes "made to the version from the time it 
 target version were identical", as Insert, Delete and Update, and that it "lists the modified
 layers and the features that were edited in those layers"
 ([View traditional version changes](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/using-the-version-changes-command.html)).
-It does that inside Pro, for a version you are connected to, and a selected feature shows its Current, Target
-and Common Ancestor values. The page does not say whether the differences can be exported or scripted.
+It does that inside Pro, for a version you are connected to, and a selected feature shows its current, target
+and common ancestor representations. The page does not say whether the differences can be exported or scripted.
 This tool adds a different thing: a list you can diff and keep from an export, an exit code, a
 count of the edits the parent already holds, and a check of every nested version in the same run.
 
@@ -134,7 +134,7 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 209 assertions, line for line, on Windows (Python 3.13.2), on
+The self-test prints the same 211 assertions, line for line, on Windows (Python 3.13.2), on
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
@@ -512,7 +512,7 @@ The snapshot is opened with mode `x`, so an existing file is refused with exit 2
 overwritten. The snapshot stores the `--key-field` values of every row the owner deleted or changed,
 with surrounding whitespace removed, repeats collapsed and blank keys left out. Point `--key-field` at a business key, not at a column that holds personal data, and
 treat the snapshot as sensitive as that column.
-The snapshot also stores an unsalted SHA-256 of every other column of each row the owner changed,
+The snapshot also stores an unsalted SHA-256 digest, one per row, over the other columns of each row the owner changed,
 so a low-entropy column, such as a phone number, a birth date or a short code, can be guessed from a
 leaked snapshot. Treat the snapshot as sensitive as the most sensitive exported column.
 
@@ -698,6 +698,28 @@ the tool could not make sense of its input.
   when `--edit-version` is one of them. The tree walk starts at the named version.
 - The first line of `reconverify.py` is `#!/usr/bin/env python`. A stock Ubuntu install has only
   `python3`, so `./reconverify.py` fails there. Run `python3 reconverify.py`.
+- A table that has a `T.base.csv` but no `T.adds.csv` or `T.deletes.csv` stops the run with exit 2 and
+  a raw "No such file or directory" message. It is not read as clean. Export the empty delta tables
+  with their headers.
+- The column names of `states.csv` (`state_id`, `parent_state_id`) and of `versions.csv` (`name`,
+  `state_id`, `parent_name`) are this tool's contract. None of the Esri pages cited here names them,
+  so check them against your own `SDE_states` and `SDE_versions` tables.
+- A non-numeric value in a deletes file is refused with exit 3, and the message names the file but
+  not the row. A bad object id in a base or adds file is named by file and column, not by line.
+- A change in how a column is exported, such as another text encoding or extra whitespace, counts
+  as an edit, because the row digests compare the exported text.
+- With `--apply`, the plan prints its verdict before it writes the snapshot. If the snapshot file
+  exists, the output still ends in a clean verdict while the exit code is 2. Read the exit code.
+- The snapshot is written even when the plan has findings (exit 1), so a snapshot file on disk does
+  not mean the plan was clean.
+- A failed `--self-test` exits 1, the same code as a finding. A job that gates on the self-test must
+  treat any nonzero exit as a tool failure.
+- A symlink in the export directory is followed, and the file it points to is read and hashed.
+- The README demos (plan, verify, unposted and nested blocks) come from fixtures that are not
+  shipped, so a reader cannot rerun them.
+- This working-tree file may have CRLF line endings on Windows (`core.autocrlf`). Copied straight to
+  Linux, the first line then ends in a carriage return. Clone the repository there, or run
+  `python3 reconverify.py`.
 
 ## Contributing
 
