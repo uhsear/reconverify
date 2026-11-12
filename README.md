@@ -58,6 +58,8 @@ PASS  a parent row that repeats the key of an updated row is a finding  <-- pinn
 ...
 PASS  a keyed verify that sees an arrival with no key is not clean  <-- pinned defect
 ...
+PASS  a keyed verify that sees an arrival repeat an untouched live key is not clean  <-- pinned defect
+...
 PASS  an owner update of a row the parent deleted is forecast at the plan  <-- pinned defect
 ...
 PASS  a parent that made the same edit as the owner is not a post  <-- pinned defect
@@ -98,10 +100,10 @@ PASS  the footer reports failures by count and by name, and exits 1  <-- pinned 
 PASS  importing the module prints nothing and exposes the core
 ...
 --------------------------------------------------------------------
-211 assertions, 0 failed
+213 assertions, 0 failed
 ```
 
-The full run prints all 211 assertions. Each `...` line above is where this block is cut.
+The full run prints all 213 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -134,11 +136,11 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 211 assertions, line for line, on Windows (Python 3.13.2), on
+The self-test prints the same 213 assertions, line for line, on Windows (Python 3.13.2), on
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (1049 statements, 240 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (1063 statements, 248 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -227,7 +229,7 @@ python reconverify.py now/ --edit-version OWNER.SANDBOX --unposted --tree
 | `--before` | off | Verify `EXPORT`, taken after the reconcile, against this snapshot. |
 | `--snapshot` | off | Where the plan writes its snapshot. Needs `--apply`. |
 | `--oid-field` | `OBJECTID` | The object id column of the exported tables. |
-| `--key-field` | off | A business key that survives a reload. It makes the reload count exact. |
+| `--key-field` | off | A business key that survives a reload. It makes the reload count exact for rows that repeat a key. |
 | `--sample` | `10` | With a plan or `--before`, how many object ids are listed after a finding. `0` lists none. |
 | `--unposted` | off | List the edits the version holds that its parent does not, row by row. Reads one export. Writes nothing. |
 | `--tree` | off | With `--unposted`, also list the unposted rows of every version nested under `--edit-version`. Without it the nested versions are still read, and an unposted edit in one is still a finding. |
@@ -278,7 +280,9 @@ raised for:
   A delete that both sides made is not listed. Column-level detection is not modelled.
 - **A reload.** With `--key-field`, a row that arrives in the version under a new object id with
   the key of a row the owner deleted, or the key of a row the owner changed. The second case
-  leaves the version holding the key twice. A blank key is a hole in the data and matches
+  leaves the version holding the key twice. In a verify, an arriving row that repeats the key of
+  any other live row of the version is a finding too, because the version then holds that key
+  twice. A blank key is a hole in the data and matches
   nothing, but it is not proof of no reload. A row that arrives with no key is a finding when the
   parent deleted rows the owner also deleted, and in a verify any arriving row with no key is a
   finding, because the tool cannot tell a reload from an ordinary insert. Without `--key-field`,
@@ -560,8 +564,9 @@ the tool could not make sense of its input.
   export passes it. A byte-different re-export of an unchanged state counts as fresh. The tool
   cannot prove that the second export came from a different process.
 - This tool prints `N -> M rows, K arrived` and flags growth only when it
-  matches a key or an owner delete. A parent reload that overlaps none of the owner's rows grows
-  the version with no finding when `--key-field` is given. Without `--key-field`, a verify that
+  matches a key or an owner delete, or repeats the key of a live row. A parent reload that
+  overlaps none of the owner's rows and repeats no live key grows the version with no finding
+  when `--key-field` is given. Without `--key-field`, a verify that
   sees arrived rows and finds no reload prints a `reload check` line and raises a finding that a
   reload under new object ids cannot be ruled out, so it exits 1. A parent that only inserted
   rows therefore also exits 1 until you plan again with `--key-field`.
@@ -600,6 +605,11 @@ the tool could not make sense of its input.
   that was reconciled with nothing to carry can therefore exit 1 under `--unposted`.
 - A nested version is behind when its lineage lacks its parent's head state. The tool cannot know
   whether the run was meant to reach it, so a child that you left alone on purpose is reported.
+- A nested version that was created from the sandbox before the sandbox moved, and that holds no
+  edits of its own, is reported as behind its parent and the run exits 1, even though it has
+  nothing to post.
+- The behind check covers nested versions only. `--unposted` on a named version that is itself
+  behind its parent exits 0 when that version has no unposted rows.
 - Esri's pages do not say whether `ALL_VERSIONS` reaches versions nested under a version that is
   not the target. This repository did not run the Esri tool, so it makes no claim about what that
   tool did on any run. It checks the outcome that the exports show.
@@ -627,7 +637,17 @@ the tool could not make sense of its input.
   head. The tool cannot tell a parent that moved after a good reconcile from a reconcile that ran
   too early, so it is a finding and the run exits 1. Reconcile again and export again, or plan
   again.
-- Column names are matched exactly, including case. The default object id column is `OBJECTID`.
+- Column names are matched exactly, including case. Esri's 10.0 delta-table page writes
+  `SDE_state_ID`, `SDE_Deletes_Row_ID` and `Deleted_At`, and this tool expects the upper-case
+  names in the contract table above. An export that keeps the page's casing is refused with exit 3.
+- When an id or state cell is not a whole number, the error text quotes the cell. If `--oid-field`
+  names a text column by mistake, free text from that column can reach stderr.
+- The snapshot is a JSON file and `.gitignore` does not exclude `*.json`. A snapshot written inside
+  a working tree holds keys and digests of real data, and `git add` would take it. Write it outside
+  the repository.
+- The snapshot also stores a SHA-256 of every exported `.csv` file as a whole, for the freshness
+  test, and the parent-side row digests of the rows the owner changed.
+ The default object id column is `OBJECTID`.
   A PostgreSQL export with lower-case headers is refused with exit 3 (`has no column`), and
   `--oid-field` changes only the object id column.
 - Output is printed with the console's encoding. A key, version or table name that the encoding
@@ -720,8 +740,9 @@ the tool could not make sense of its input.
   shipped, so a reader cannot rerun them.
 - Key matching is exact after surrounding whitespace is removed. A case change or a zero-padding change
   in a reloaded business key is not matched as a reload.
-- The tool takes no token, password or URL, makes no network call and reads nothing from the
-  environment, so it handles no credentials. The export and the snapshot are the only sensitive data.
+- The tool takes no token, password or URL, makes no network call and reads no credential or
+  setting from the environment, so it handles no credentials. The self-test's temporary
+  directory follows `TMPDIR`, `TEMP` and `TMP`. The export and the snapshot are the only sensitive data.
 - This working-tree file may have CRLF line endings on Windows (`core.autocrlf`). Copied straight to
   Linux, the first line then ends in a carriage return. Clone the repository there, or run
   `python3 reconverify.py`.

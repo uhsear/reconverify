@@ -244,6 +244,28 @@ def reload_finding(name, deleted, parent_deleted, arrived, keys,
     return []
 
 
+def duplicate_arrival_finding(name, arrived, keys, claimed, key_field,
+                              sample):
+    """A finding when an arriving row repeats the key of another live row.
+
+    The reload check only knows the keys of rows the owner deleted or
+    changed. An arrival that repeats the key of an untouched live row is the
+    same fault, the version would hold that key twice, and the read shows
+    it. Keys in claimed are already reported by reload_finding.
+    """
+    seen = {}
+    for key in keys.values():
+        if key:
+            seen[key] = seen.get(key, 0) + 1
+    dupes = sorted(o for o in arrived if keys[o] and seen[keys[o]] > 1
+                   and keys[o] not in claimed)
+    if not dupes:
+        return []
+    return ["%s: %d arriving row(s) carry a %s that another live row of the "
+            "version holds%s. The version holds each key twice"
+            % (name, len(dupes), key_field, ids(dupes, sample))]
+
+
 def conflict_finding(name, changed, deleted, p_changed, p_deleted, sample):
     """A finding when both sides edited one row since the common ancestor.
 
@@ -681,6 +703,10 @@ def verify(snap, export, version, sample):
             set(was["deleted_keys"]), set(was["changed_keys"]), key_field,
             sample)
         findings.extend(reloads)
+        if key_field:
+            findings.extend(duplicate_arrival_finding(
+                name, arrived, keys, set(was["deleted_keys"])
+                | set(was["changed_keys"]), key_field, sample))
         blank = sorted(o for o in arrived if not keys[o])
         if key_field and blank and not reloads:
             findings.append(BLANK_ARRIVAL % (name, len(blank), key_field,
@@ -1292,6 +1318,23 @@ def self_test():
           "twice" in findings[0],
           "and the version that holds the key twice fails verify  "
           "<-- pinned defect")
+    lines, findings = verify_of(upd_snap, reconciled(
+        "dup_live", upd_adds + [(201, 2, "R-05", "Road 201", "DIRT")]
+        + [(4, 20, "R-04", "Road 4", "PAVED")], upd_dels + [(4, 0, 20)]),
+        "ROAD_KEY")
+    check(len(findings) == 1 and "1 arriving row(s) carry a ROAD_KEY that "
+          "another live row of the version holds, e.g. 201. The version "
+          "holds each key twice" in findings[0],
+          "a keyed verify that sees an arrival repeat an untouched live key "
+          "is not clean  <-- pinned defect")
+    check(duplicate_arrival_finding("T", [5], {5: "K", 6: "K"}, set(["K"]),
+                                    "F", 10) == []
+          and duplicate_arrival_finding("T", [5], {5: "K", 6: "L"}, set(),
+                                        "F", 10) == []
+          and duplicate_arrival_finding("T", [5], {5: "", 6: ""}, set(),
+                                        "F", 10) == [],
+          "a claimed key, a unique key and a blank key are not live "
+          "duplicates")
 
     lines, findings, conflict_snap = plan_of(export(
         "conflict_before", tree, versions, upd_adds, upd_dels + [(4, 0, 2)]))
