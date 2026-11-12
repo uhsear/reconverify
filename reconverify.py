@@ -670,10 +670,17 @@ def verify(snap, export, version, sample):
                             % (name, len(gone), parent, ids(gone, sample)))
         flagged = flagged or bool(posted or gone)
         keys = dict((o, v[2]) for o, v in v_view.items())
-        findings.extend(reload_finding(
+        reloads = reload_finding(
             name, was["deleted"], p_deleted, arrived, keys,
             set(was["deleted_keys"]), set(was["changed_keys"]), key_field,
-            sample))
+            sample)
+        findings.extend(reloads)
+        if arrived and not key_field and not reloads:
+            findings.append("%s: %d row(s) arrived and the snapshot has no "
+                            "key field, so a reload under new object ids "
+                            "cannot be ruled out. Plan again with "
+                            "--key-field and verify against that snapshot"
+                            % (name, len(arrived)))
         line, found = client_finding(name, table, v_view, sample)
         lines.append(line)
         if found:
@@ -825,6 +832,16 @@ def load_export(folder, oid_field, key_field):
         raise ValueError("versions.csv names a parent that is not a version "
                          "name, for %s. Names are matched as written, so fix "
                          "the parent_name column" % ", ".join(orphans))
+    # File names are matched in exact lower case. An odd-case name would be
+    # left out of every check while the run exits 0, so it is refused.
+    oddcase = sorted(n for n in names
+                     for suffix in (".base.csv",) + DELTA_SUFFIXES
+                     if n.lower().endswith(suffix) and not n.endswith(suffix))
+    if oddcase:
+        raise ValueError("%s would not be read, because file names are "
+                         "matched in lower case. Rename the file so it ends "
+                         "in .base.csv, .adds.csv, .deletes.csv or "
+                         ".client.csv exactly" % ", ".join(oddcase))
     # A delta file without its base would drop that table, and any edit the
     # owner made in it, out of every check unflagged.
     based = set(n[:-len(".base.csv")] for n in names if n.endswith(".base.csv"))
@@ -1677,12 +1694,13 @@ def self_test():
                             for n in range(1, 10)],
                         shared_dels + own_dels + quiet_dels + redo_quiet)
     code, out, err = run_cli([arrive_dir] + sv + ["--before", snap_path])
-    check(code == 0 and "9 arrived" in out
-          and "no reload signal, but rows arrived and without --key-field a "
-          "reload under new object ids cannot be ruled out" in out
-          and "no reload." not in out and RELOAD_UNKNOWN in out,
-          "an unkeyed verify with arrived rows does not claim no reload  "
-          "<-- pinned defect")
+    check(code == 1 and "9 arrived" in out
+          and "FINDING  ROADS: 9 row(s) arrived and the snapshot has no key "
+          "field, so a reload under new object ids cannot be ruled out"
+          in out and "no reload." not in out and RELOAD_UNKNOWN in out
+          and "VERDICT: 1 finding(s). The reconcile is not verified" in out,
+          "an unkeyed verify with arrived rows cannot tell, so it exits 1, "
+          "not 0  <-- pinned defect")
     qkey_path = os.path.join(tmp, "snap_qkey.json")
     run_cli([quiet_dir] + sv + ["--key-field", "ROAD_KEY", "--snapshot",
                                 qkey_path, "--apply"])
@@ -1930,6 +1948,20 @@ def self_test():
             "a %s delta file with no PARCELS.base.csv is refused, not dropped  "
             "<-- pinned defect" % label, "no PARCELS.base.csv")
 
+    for old, new in (("ROADS.base.csv", "ROADS.BASE.CSV"),
+                     ("ROADS.adds.csv", "ROADS.Adds.csv"),
+                     ("ROADS.deletes.csv", "ROADS.DELETES.CSV")):
+        folder = os.path.join(tmp, "oddcase_" + new)
+        shutil.copytree(quiet_dir, folder)
+        os.rename(os.path.join(folder, old), os.path.join(folder, new))
+        raises(lambda: load_export(folder, "OBJECTID", None),
+               "%s is refused, not left out of every check  "
+               "<-- pinned defect" % new, "%s would not be read" % new)
+        code, out, err = run_cli([folder] + sv)
+        check(code == 3 and "VERDICT" not in out,
+              "a plan of an export with %s exits 3, not 0  "
+              "<-- pinned defect" % new)
+
     for flag in ("--before", "--snapshot", "--key-field", "--oid-field"):
         code, out, err = run_cli([quiet_dir] + sv + [flag, ""])
         check(code == 64 and "%s needs a value" % flag in err and not out,
@@ -2144,10 +2176,7 @@ def main(argv=None):
               "nothing posted, %s. Edits made after the plan, and tables "
               "outside the snapshot, are not covered.%s" % (
                   ", ".join(sorted(snap["tables"])) or "no table",
-                  "no reload signal, but rows arrived and without "
-                  "--key-field a reload under new object ids cannot be "
-                  "ruled out" if any(l.startswith(RELOAD_UNKNOWN)
-                                     for l in lines) else "no reload", note))
+                  "no reload", note))
     else:
         print("VERDICT: %d finding(s). Explain each before you reconcile."
               % len(findings) if findings else

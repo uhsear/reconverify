@@ -74,7 +74,7 @@ PASS  without --tree the nested rows are counted, not listed  <-- pinned defect
 PASS  a nested version a reconcile skipped is a finding, not a note  <-- pinned defect
 ...
 PASS  the clean verdict names the tables it checked and what it cannot cover  <-- pinned defect
-PASS  an unkeyed verify with arrived rows does not claim no reload  <-- pinned defect
+PASS  an unkeyed verify with arrived rows cannot tell, so it exits 1, not 0  <-- pinned defect
 ...
 PASS  a plan whose version states show no own row exits 1, not 0  <-- pinned defect
 PASS  and its verify exits 1, never 'own edits intact'  <-- pinned defect
@@ -95,10 +95,10 @@ PASS  the footer reports failures by count and by name, and exits 1  <-- pinned 
 PASS  importing the module prints nothing and exposes the core
 ...
 --------------------------------------------------------------------
-203 assertions, 0 failed
+209 assertions, 0 failed
 ```
 
-The full run prints all 203 assertions. Each `...` line above is where this block is cut.
+The full run prints all 209 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -131,11 +131,11 @@ nothing. That shows no equivalent was found on GitHub, not that none exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The geodatabase is read only through CSV exports that you make.
 
-The self-test prints the same 203 assertions, line for line, on Windows (Python 3.13.2), on
+The self-test prints the same 209 assertions, line for line, on Windows (Python 3.13.2), on
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (1026 statements, 230 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (1039 statements, 236 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -190,7 +190,7 @@ Three things about the exports are not guaranteed, and the tool enforces what it
   (`SELECT TOP 1 * FROM sde.SDE_versions` on SQL Server), and build `OWNER.NAME` for the name and
   for the parent name yourself. Esri says the system tables may be viewed with SQL and must not
   be altered with anything but ArcGIS software or the SDK
-  ([System tables in PostgreSQL](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-postgresql/geodatabase-system-tables-postgresql.html)).
+  ([System tables in SQL Server](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-sql-server/geodatabase-system-tables-sqlserver.html), which says "Do not alter the system tables and their contents using anything other than ArcGIS software or SDK. However, you can view the contents of the system tables using SQL").
   The default version has no parent and should export an empty `parent_name`. A version name
   must appear once, and the tool refuses a duplicate. A `parent_name` that matches no version
   name is refused with exit 3. Names are matched as written, so
@@ -326,9 +326,10 @@ A finding is raised when any of these hold:
   edit in them. The tool cannot tell an empty state from an edit in a table that was not exported,
   so it does not say the edits are intact.
 
-Without `--key-field`, rows that arrive cannot be told from ordinary parent inserts. The verdict
-then says `no reload signal` and that a reload cannot be ruled out, and a `reload check` line
-names the count.
+Without `--key-field`, rows that arrive cannot be told from ordinary parent inserts. A `reload
+check` line names the count, and the run raises a finding that a reload under new object ids
+cannot be ruled out, so it exits 1 and does not say `no reload`. Plan again with `--key-field` to
+settle it. When a reload is already found, only that finding is raised.
 
 ```
 $ python reconverify.py after_lost --edit-version OWNER.SANDBOX --before snap.json
@@ -551,9 +552,10 @@ the tool could not make sense of its input.
   cannot prove that the second export came from a different process.
 - This tool prints `N -> M rows, K arrived` and flags growth only when it
   matches a key or an owner delete. A parent reload that overlaps none of the owner's rows grows
-  the version with no finding. Without `--key-field`, a verify that sees arrived rows prints a
-  `reload check` line, and its verdict says `no reload signal` and that a reload under new object
-  ids cannot be ruled out. It does not say `no reload`.
+  the version with no finding when `--key-field` is given. Without `--key-field`, a verify that
+  sees arrived rows and finds no reload prints a `reload check` line and raises a finding that a
+  reload under new object ids cannot be ruled out, so it exits 1. A parent that only inserted
+  rows therefore also exits 1 until you plan again with `--key-field`.
 - After a compress, the states the snapshot names may be gone. A snapshot whose old common
   ancestor is not in the new lineage is refused with exit 3. Verify before the compress. The
   refusal then blames a missing reconcile, but the cause is the compress.
@@ -561,8 +563,10 @@ the tool could not make sense of its input.
   headers, is refused with exit 3 and `has no column`. Write the header even for an empty table.
 - A CSV cell larger than 128 KB, such as long geometry text, raises `csv.Error` and the run exits
   2. That is a tool failure, not a clean read, so a job must not treat exit 2 as no findings.
-- File names are matched in lower case. A table exported as `T.BASE.CSV` is not read, and a delta
-  file with an odd-case name is not flagged as stray, so the table is left out of every check.
+- File names are matched in exact lower case. A table file such as `T.BASE.CSV` or
+  `T.Adds.csv` is refused with exit 3 and the file is named, on every platform, because it would
+  otherwise be left out of every check. `states.csv` and `versions.csv` are opened by their
+  lower-case names, so a differently cased copy is found on Windows and missing on Linux.
 - Every export file is read whole into memory. Walking the lineage of a 30,000-state chain took
   about 0.005 seconds on the Windows workstation. That is not a timing of the whole export load, and a very large adds table
   is not what this is for.
@@ -631,8 +635,7 @@ the tool could not make sense of its input.
   restrict the snapshot's file permissions, so it is written with the default permissions of the
   account that ran the tool.
 
-- The demo outputs are trimmed from runs on synthetic exports that are not shipped, and one line
-  (the client read) was removed from the `after_clean` demo. Only the reload demo matches a
+- The demo outputs are trimmed from runs on synthetic exports that are not shipped. Only the reload demo matches a
   self-test fixture, so a reader cannot rerun the demos from the repository alone.
 - A freshly created, unedited version may exit 1 under `--unposted` if the server gives it a
   state of its own. How a live server numbers a new version's state was not checked.
@@ -663,6 +666,20 @@ the tool could not make sense of its input.
 - An earlier commit message says "Flag nested child versions that a reconcile skipped, still
   exit 0". It does not mean the tool exits 0 on a skipped child. A skipped child is a finding and
   the run exits 1.
+
+- The meaning of the delta-table columns (`SDE_STATE_ID`, `SDE_DELETES_ROW_ID`, `DELETED_AT`)
+  comes only from Esri's archived 10.0 pages. No current Esri page was found that confirms it.
+- The Differences view comparison above names the Pro command. Esri's "Edit versioned data with
+  SQL" page, cited above, describes a second route: compare versions through versioned views.
+  This tool does not use that route.
+- The fresh read is the exporter's job. This tool cannot check that an export was fresh. The
+  byte test above only refuses an export that is identical to the snapshot's.
+- `--self-test` together with an export and `--edit-version` runs only the self-test and exits 0.
+  It ignores the export, so a job that adds `--self-test` by mistake checks nothing.
+- A loop in version names, such as two versions that name each other as parent, is found only
+  when `--edit-version` is one of them. The tree walk starts at the named version.
+- The first line of `reconverify.py` is `#!/usr/bin/env python`. A default Ubuntu host has only
+  `python3`, so `./reconverify.py` fails there. Run `python3 reconverify.py`.
 
 ## Contributing
 
