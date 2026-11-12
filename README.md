@@ -138,7 +138,7 @@ The self-test prints the same 211 assertions, line for line, on Windows (Python 
 Windows under Python 3.12, 3.10.20 and 3.9.25, on Ubuntu (Python 3.12.3) and on Ubuntu under
 Python 3.9.
 `coverage run --branch reconverify.py --self-test` reports 100 percent of lines and branches on
-Windows (1039 statements, 236 branches). Coverage is not installed on the Ubuntu host, so it was
+Windows (1049 statements, 240 branches). Coverage is not installed on the Ubuntu host, so it was
 not measured there.
 
 ```
@@ -572,6 +572,7 @@ the tool could not make sense of its input.
   headers, is refused with exit 3 and `has no column`. Write the header even for an empty table.
 - A CSV cell larger than 128 KB, such as long geometry text, raises `csv.Error` and the run exits
   2. That is a tool failure, not a clean read, so a job must not treat exit 2 as no findings.
+  Re-exporting gives the same cell, so drop the shape column from the export.
 - File names are matched in exact lower case. A table file such as `T.BASE.CSV` or
   `T.Adds.csv` is refused with exit 3 and the file is named, on every platform, because it would
   otherwise be left out of every check. `states.csv` and `versions.csv` are opened by their
@@ -717,6 +718,10 @@ the tool could not make sense of its input.
 - A symlink in the export directory is followed, and the file it points to is read and hashed.
 - The README demos (plan, verify, unposted and nested blocks) come from fixtures that are not
   shipped, so a reader cannot rerun them.
+- Key matching is exact after surrounding whitespace is removed. A case change or a zero-padding change
+  in a reloaded business key is not matched as a reload.
+- The tool takes no token, password or URL, makes no network call and reads nothing from the
+  environment, so it handles no credentials. The export and the snapshot are the only sensitive data.
 - This working-tree file may have CRLF line endings on Windows (`core.autocrlf`). Copied straight to
   Linux, the first line then ends in a carriage return. Clone the repository there, or run
   `python3 reconverify.py`.
