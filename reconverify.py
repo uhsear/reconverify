@@ -198,6 +198,8 @@ NO_OWN_EDIT = ("%s: holds states the parent does not, and no exported table "
                "which. %s")
 
 RELOAD_UNKNOWN = "  reload check          "
+BLANK_ARRIVAL = ("%s: %d arriving row(s) carry no %s%s, so a reload under "
+                 "new object ids cannot be ruled out for them")
 
 
 def reload_finding(name, deleted, parent_deleted, arrived, keys,
@@ -228,6 +230,10 @@ def reload_finding(name, deleted, parent_deleted, arrived, keys,
                        "owner changed%s. The version would hold each key "
                        "twice" % (name, len(dupes), key_field,
                                   ids(dupes, sample)))
+        blank = sorted(o for o in arrived if not keys[o])
+        if blank and set(deleted) & set(parent_deleted):
+            out.append(BLANK_ARRIVAL % (name, len(blank), key_field,
+                                        ids(blank, sample)))
         return out
     absorbed = sorted(set(deleted) & set(parent_deleted))
     if absorbed and arrived:
@@ -675,6 +681,10 @@ def verify(snap, export, version, sample):
             set(was["deleted_keys"]), set(was["changed_keys"]), key_field,
             sample)
         findings.extend(reloads)
+        blank = sorted(o for o in arrived if not keys[o])
+        if key_field and blank and not reloads:
+            findings.append(BLANK_ARRIVAL % (name, len(blank), key_field,
+                                             ids(blank, sample)))
         if arrived and not key_field and not reloads:
             findings.append("%s: %d row(s) arrived and the snapshot has no "
                             "key field, so a reload under new object ids "
@@ -1251,6 +1261,13 @@ def self_test():
                          10) == [],
           "and a blank key in a hand-edited snapshot matches nothing")
 
+    check(reload_finding("T", [4], [4], [5], {5: ""}, set(), set(), "K", 10)
+          == [BLANK_ARRIVAL % ("T", 1, "K", ", e.g. 5")]
+          and reload_finding("T", [4], [], [5], {5: ""}, set(), set(), "K",
+                             10) == [],
+          "a blank-key arrival after the parent deleted the owner's rows "
+          "cannot be ruled out  <-- pinned defect")
+
     upd_adds = [(4, 11, "R-04", "Road 4", "PAVED")]
     upd_dels = [(4, 0, 11)]
     twin = [(200, 2, "R-04", "Road 4", "DIRT")]
@@ -1259,6 +1276,13 @@ def self_test():
     check(len(findings) == 1 and "1 arriving row(s) carry the ROAD_KEY of a "
           "row the owner changed, e.g. 200" in findings[0],
           "a parent row that repeats the key of an updated row is a finding  "
+          "<-- pinned defect")
+    lines, findings = verify_of(upd_snap, reconciled(
+        "blank_arrive", upd_adds + [(201, 2, " ", "Road 201", "DIRT")]
+        + [(4, 20, "R-04", "Road 4", "PAVED")], upd_dels + [(4, 0, 20)]),
+        "ROAD_KEY")
+    check(len(findings) == 1 and "carry no ROAD_KEY, e.g. 201" in findings[0],
+          "a keyed verify that sees an arrival with no key is not clean  "
           "<-- pinned defect")
     lines, findings = verify_of(upd_snap, reconciled(
         "upd_after", upd_adds + twin + [(4, 20, "R-04", "Road 4", "PAVED")],

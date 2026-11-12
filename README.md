@@ -53,7 +53,10 @@ PASS  the plan says the same of such a version, not nothing found  <-- pinned de
 ...
 PASS  a blank key is no key: a new road with a blank key does not match a deleted road with a blank key  <-- pinned defect
 ...
+PASS  a blank-key arrival after the parent deleted the owner's rows cannot be ruled out  <-- pinned defect
 PASS  a parent row that repeats the key of an updated row is a finding  <-- pinned defect
+...
+PASS  a keyed verify that sees an arrival with no key is not clean  <-- pinned defect
 ...
 PASS  an owner update of a row the parent deleted is forecast at the plan  <-- pinned defect
 ...
@@ -95,7 +98,7 @@ PASS  the footer reports failures by count and by name, and exits 1  <-- pinned 
 PASS  importing the module prints nothing and exposes the core
 ...
 --------------------------------------------------------------------
-209 assertions, 0 failed
+211 assertions, 0 failed
 ```
 
 The full run prints all 209 assertions. Each `...` line above is where this block is cut.
@@ -276,8 +279,10 @@ raised for:
 - **A reload.** With `--key-field`, a row that arrives in the version under a new object id with
   the key of a row the owner deleted, or the key of a row the owner changed. The second case
   leaves the version holding the key twice. A blank key is a hole in the data and matches
-  nothing. Without `--key-field`, the signal is weaker: the parent deleted rows the owner also
-  deleted while new rows arrive.
+  nothing, but it is not proof of no reload. A row that arrives with no key is a finding when the
+  parent deleted rows the owner also deleted, and in a verify any arriving row with no key is a
+  finding, because the tool cannot tell a reload from an ordinary insert. Without `--key-field`,
+  the signal is weaker: the parent deleted rows the owner also deleted while new rows arrive.
 
 ```
 $ python reconverify.py before_reload --edit-version OWNER.SANDBOX --key-field ROAD_KEY
@@ -320,7 +325,8 @@ A finding is raised when any of these hold:
   parent, and was not there at the plan, is named. A parent that made the same edit as the owner
   before the plan is not a post.
 - **A reload.** Rows arrived that carry a key the owner deleted or changed, with the same rules
-  as the plan.
+  as the plan. With `--key-field`, a row that arrives with a blank key is also a finding, because
+  the tool cannot match it to anything.
 - **A client read that disagrees** with the derived view.
 - **No own edit was seen.** The version holds states of its own, and no exported table shows an
   edit in them. The tool cannot tell an empty state from an edit in a table that was not exported,
@@ -506,6 +512,9 @@ The snapshot is opened with mode `x`, so an existing file is refused with exit 2
 overwritten. The snapshot stores the `--key-field` values of every row the owner deleted or changed,
 with surrounding whitespace removed, repeats collapsed and blank keys left out. Point `--key-field` at a business key, not at a column that holds personal data, and
 treat the snapshot as sensitive as that column.
+The snapshot also stores an unsalted SHA-256 of every other column of each row the owner changed,
+so a low-entropy column, such as a phone number, a birth date or a short code, can be guessed from a
+leaked snapshot. Treat the snapshot as sensitive as the most sensitive exported column.
 
 ## Exit codes
 
@@ -669,16 +678,25 @@ the tool could not make sense of its input.
 
 - The meaning of the delta-table columns (`SDE_STATE_ID`, `SDE_DELETES_ROW_ID`, `DELETED_AT`)
   comes only from Esri's archived 10.0 pages. No current Esri page was found that confirms it.
-- The Differences view comparison above names the Pro command. Esri's "Edit versioned data with
-  SQL" page, cited above, describes a second route: compare versions through versioned views.
-  This tool does not use that route.
+- The Differences view comparison above names the Pro command. This tool does not run it and does
+  not compare versions through versioned views.
+- The three conflict types come from Esri's branch-versioning REST page. No traditional-versioning
+  page was found that lists them, so the row-level conflict model for traditional versions is this
+  tool's own reading.
+- The fresh read is an export you make. No exporter or child process is included.
+- A CSV line that holds only whitespace is read as a one-cell row and refused with exit 3.
+- A row in an adds or deletes file whose state is absent from `states.csv` is ignored without a
+  warning. That is right for a state outside the version's lineage, but it hides an edit if the
+  state list is older than the tables.
+- Any extra `*.base.csv` left in the export directory, such as a stale table from an earlier export,
+  is read as a table and judged like the rest.
 - The fresh read is the exporter's job. This tool cannot check that an export was fresh. The
   byte test above only refuses an export that is identical to the snapshot's.
 - `--self-test` together with an export and `--edit-version` runs only the self-test and exits 0.
   It ignores the export, so a job that adds `--self-test` by mistake checks nothing.
 - A loop in version names, such as two versions that name each other as parent, is found only
   when `--edit-version` is one of them. The tree walk starts at the named version.
-- The first line of `reconverify.py` is `#!/usr/bin/env python`. A default Ubuntu host has only
+- The first line of `reconverify.py` is `#!/usr/bin/env python`. A stock Ubuntu install has only
   `python3`, so `./reconverify.py` fails there. Run `python3 reconverify.py`.
 
 ## Contributing
