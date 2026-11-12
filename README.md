@@ -743,6 +743,10 @@ the tool could not make sense of its input.
 - The tool takes no token, password or URL, makes no network call and reads no credential or
   setting from the environment, so it handles no credentials. The self-test's temporary
   directory follows `TMPDIR`, `TEMP` and `TMP`. The export and the snapshot are the only sensitive data.
+- The `--help` text width follows `COLUMNS`, because `argparse` reads it. Only that width and the
+  self-test temporary directory follow the environment.
+- PowerShell `Out-File` and `Export-Csv` can write UTF-16 or a `#TYPE` first line. The tool refuses
+  such a file with exit 3, so export as UTF-8 with no type line (`-Encoding utf8 -NoTypeInformation`).
 - This working-tree file may have CRLF line endings on Windows (`core.autocrlf`). Copied straight to
   Linux, the first line then ends in a carriage return. Clone the repository there, or run
   `python3 reconverify.py`.
